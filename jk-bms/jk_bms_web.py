@@ -3,6 +3,7 @@
 # JK-BMS Dashboard – Version 1.0.0 by M. Voege
 # for Venus OS Large 3.7x Raspberry Pi
 # D-Bus-Treiber wird benötigt von https://github.com/mr-manuel/venus-os_dbus-serialbattery
+# Optimiert für Victron Mppt 100/50 und JKBMS B2A8S20P v19
 
 import dbus
 import sys
@@ -21,7 +22,7 @@ from dbus.mainloop.glib import DBusGMainLoop
 
 # ====================================== WARNSTUFEN – HIER ANPASSEN =======================================
 # D-Bus anpassen! Prüfe mit: dbus -y | grep battery
-DASHBOARD_NAME = ""                                     # Tilel
+DASHBOARD_NAME = ""                                     # Dein Tilel Name hier oder mit "" leer lassen
 MAX_PACK_VOLTAGE_WARNING = 29.40                        # Ab dieser Pack-Spannung: rote Warnung + Blinken
 MAX_CELL_VOLTAGE_WARNING = 3.65                         # Ab dieser Zellspannung: Zelle rot + ⚠️
 BALANCING_START_DELTA = 0.005                           # Ab dieser Delta gilt Balancing als aktiv
@@ -30,8 +31,8 @@ LOW_VOLTAGE_WARNING = 24.00                             # Warnung ab dieser Span
 LOW_SOC_WARNING = 25                                    # Warnung ab diesem SOC in % (0 = deaktivieren)
 MIN_CHARGE_CURRENT_FOR_PULSE = 1.0                      # Ladestrom muss mind. X A sein für Puls (Absorption)
 PORT = 99                                               # Webserver-Port (Standard: 99)
-HISTORY_WINDOW_START_HOUR = 4
-TASMOTA_IPS = ["192.168.0.14", "192.168.0.17"] # Tasmota Geräte – IPs hier eintragen
+HISTORY_WINDOW_START_HOUR = 4                           # Real Time reset
+TASMOTA_IPS = ["192.168.0.14", "192.168.0.17"]          # Tasmota Geräte – IPs hier eintragen
 # =========================================================================================================
 battery_services = []
 mppt_services = []
