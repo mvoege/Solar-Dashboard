@@ -5,7 +5,7 @@ Venus OS (vorzugsweise "Large" Image).
 Ein installierter D-Bus Treiber für JKBMS (venus-os_dbus-serialbattery). 
 https://github.com/mr-manuel/venus-os_dbus-serialbattery
 
-Performantes Web-Dashboard für das JK-BMS und Victron Mppt, optimiert für Victron Venus OS (Raspberry Pi).
+Web-Dashboard für das JK-BMS und Victron Mppt, optimiert für Victron Venus OS (Raspberry Pi).
 Diese Anwendung liest Daten über den D-Bus aus und visualisiert sie in Echtzeit in einem modernen Browser-Interface.
 
 🌟 Features
