@@ -1,6 +1,6 @@
 Solar Web Dashboard für VenusOS 3.xx JKBMS B2A8S20P v19 and Victron Mppt 100/50
 
-🛠 Voraussetzungen
+🛠 Voraussetzungen:
 Venus OS (vorzugsweise "Large" Image).
 Ein installierter D-Bus Treiber für JKBMS (venus-os_dbus-serialbattery). 
 https://github.com/mr-manuel/venus-os_dbus-serialbattery
