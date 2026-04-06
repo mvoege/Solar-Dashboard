@@ -1,0 +1,2 @@
+# Solar-Dashboard
+Web Dashboard vor VenusOS 3.7x JK-BMS v24 and Victron Mppt 100/50
