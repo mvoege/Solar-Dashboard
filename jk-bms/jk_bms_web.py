@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# JK-BMS Dashboard – Version 1.0.0 by Michael Vöge
+# JK-BMS Dashboard – Version 1.0.0 by M. Voege
 # for Venus OS Large 3.7x Raspberry Pi
 # D-Bus-Treiber wird benötigt von https://github.com/mr-manuel/venus-os_dbus-serialbattery
 
