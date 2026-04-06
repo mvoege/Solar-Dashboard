@@ -5,7 +5,7 @@ Venus OS (vorzugsweise "Large" Image).
 Ein installierter D-Bus Treiber für das JK-BMS (z.B. venus-os_dbus-serialbattery). https://github.com/mr-manuel/venus-os_dbus-serialbattery
 Python 3 (auf Venus OS standardmäßig vorhanden).
 
-Ein leichtgewichtiges, performantes Web-Dashboard für das JK-BMS, optimiert für Victron Venus OS Large (Raspberry Pi).
+Performantes Web-Dashboard für das JK-BMS und Victron Mppt, optimiert für Victron Venus OS (Raspberry Pi).
 Diese Anwendung liest Daten über den D-Bus aus und visualisiert sie in Echtzeit in einem modernen Browser-Interface.
 
 🌟 Features
@@ -26,9 +26,15 @@ Tasmota-Integration:
 Direktes Schalten von Tasmota-Steckdosen über das Dashboard.
 
 Smart Features:
-Auto-Fullscreen & Wake-Lock: Verhindert das Abschalten des Displays (ideal für Wand-Tablets).
-Dark/Light Mode: Anpassbares Design.
-Warnsystem: Optische Alarme bei Überspannung oder niedrigem SOC.
+
+Auto-Fullscreen & Wake-Lock:
+Verhindert das Abschalten des Displays (ideal für Wand-Tablets).
+
+Dark/Light Mode:
+Anpassbares Design.
+
+Warnsystem:
+Optische Alarme bei Überspannung oder niedrigem SOC.
 
 📋 Bedienung
 Das Skript verfügt über eine integrierte Prozess-Steuerung:
@@ -64,5 +70,5 @@ Buttons für Theme-Wechsel und Temperatur werden bei Inaktivität ausgeblendet, 
 Ressourcenschonung:
 Die Daten werden im Hintergrund via AbortController mit Timeouts geladen, um auch bei älteren Tablet-Browsern oder instabilem WLAN keine Hänger zu verursachen.
 
-Nach dem Start ist das Dashboard unter http://deine-venus-ip:99 erreichbar.
+Nach dem Start ist das Dashboard unter http:// deine-venus-ip:99 erreichbar.
 <img width="1668" height="1143" alt="Screenshot" src="https://github.com/user-attachments/assets/aac59622-70d1-461f-928c-ec9091931419" />
