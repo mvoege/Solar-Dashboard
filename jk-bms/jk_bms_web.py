@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# JK-BMS Dashboard – Version 1.9.6 by M.Vöge (mit Chart-Optimierungen)
+# JK-BMS Dashboard – Version 1.0.0 by M.Vöge (mit Chart-Optimierungen)
 # for Venus OS Large 3.7x Raspberry Pi
 # D-Bus-Treiber wird benötigt von https://github.com/mr-manuel/venus-os_dbus-serialbattery
 
@@ -43,7 +43,7 @@ HISTORY_AUTOSAVE_INTERVAL = 300
 
 DEBUG = False # False / True
 
-VERSION = "1.9.6"
+VERSION = "1.0.0"
 SCRIPT_PATH = os.path.abspath(__file__)
 SCRIPT_NAME = os.path.basename(__file__)
 LOG_FILE = "/var/volatile/tmp/jk_bms_dashboard.log"
