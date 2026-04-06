@@ -1,4 +1,4 @@
-Solar Web Dashboard für VenusOS 3.xx JK-BMS v24 and Victron Mppt 100/50
+Solar Web Dashboard für VenusOS 3.xx JK-BMS v19 and Victron Mppt 100/50
 
 🛠 Voraussetzungen
 Venus OS (vorzugsweise "Large" Image).
