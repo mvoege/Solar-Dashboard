@@ -1,9 +1,9 @@
-Solar Web Dashboard für VenusOS 3.xx JK-BMS v19 and Victron Mppt 100/50
+Solar Web Dashboard für VenusOS 3.xx JKBMS B2A8S20P v19 and Victron Mppt 100/50
 
 🛠 Voraussetzungen
 Venus OS (vorzugsweise "Large" Image).
-Ein installierter D-Bus Treiber für das JK-BMS (z.B. venus-os_dbus-serialbattery). https://github.com/mr-manuel/venus-os_dbus-serialbattery
-Python 3 (auf Venus OS standardmäßig vorhanden).
+Ein installierter D-Bus Treiber für JKBMS (venus-os_dbus-serialbattery). 
+https://github.com/mr-manuel/venus-os_dbus-serialbattery
 
 Performantes Web-Dashboard für das JK-BMS und Victron Mppt, optimiert für Victron Venus OS (Raspberry Pi).
 Diese Anwendung liest Daten über den D-Bus aus und visualisiert sie in Echtzeit in einem modernen Browser-Interface.
