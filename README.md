@@ -64,5 +64,5 @@ Buttons für Theme-Wechsel und Temperatur werden bei Inaktivität ausgeblendet, 
 Ressourcenschonung:
 Die Daten werden im Hintergrund via AbortController mit Timeouts geladen, um auch bei älteren Tablet-Browsern oder instabilem WLAN keine Hänger zu verursachen.
 
-Nach dem Start ist das Dashboard unter http://<deine-venus-ip>:99 erreichbar.
+Nach dem Start ist das Dashboard unter http://deine-venus-ip:99 erreichbar.
 <img width="1668" height="1143" alt="Screenshot" src="https://github.com/user-attachments/assets/aac59622-70d1-461f-928c-ec9091931419" />
