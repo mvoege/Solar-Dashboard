@@ -55,13 +55,15 @@ history_data = {
     "mppt_pv_power":   [],
     "mppt_pv_voltage": [],
     "consumption":     [],
-    "charging":        [],
-    "cell_min_daily":  [4.5] * 24,
-    "cell_max_daily":  [0.0] * 24,
-    "last_reset_day":  None
+    "charging":        []
 }
 bms_data = {}
 data_lock = threading.Lock()
+cell_daily_stats = {
+    'min': [4.5] * 24,
+    'max': [0.0] * 24,
+    'last_reset_day': None
+}
 last_update = 0
 
 DBUS_CACHE_TTL = 1.0
@@ -441,21 +443,21 @@ def history_autosaver():
 
 def collect_data():
     log_message("History-Sammler gestartet (5s Intervall mit Mittelwertbildung)")
+    global cell_daily_stats
     samples = []
     last_save_time = time.time()
 
     while True:
         try:
             now_dt = datetime.now()
-            # Reset-ID Logik passend zur Chart-Reset-Stunde (4 Uhr)
             reset_id = now_dt.strftime("%Y-%m-%d") if now_dt.hour >= HISTORY_WINDOW_START_HOUR else (now_dt - timedelta(days=1)).strftime("%Y-%m-%d")
             
-            with data_lock:
-                if history_data.get('last_reset_day') != reset_id:
-                    history_data['cell_min_daily'] = [4.5] * 24
-                    history_data['cell_max_daily'] = [0.0] * 24
-                    history_data['last_reset_day'] = reset_id
-                    log_message(f"Zell-Tagesstatistik zurückgesetzt für {reset_id}")
+            if cell_daily_stats['last_reset_day'] != reset_id:
+                with data_lock:
+                    cell_daily_stats['min'] = [4.5] * 24
+                    cell_daily_stats['max'] = [0.0] * 24
+                    cell_daily_stats['last_reset_day'] = reset_id
+                log_message(f"Zell-Tagesstatistik zurückgesetzt für {reset_id}")
 
             if now_dt.year < 2024:
                 time.sleep(30)
@@ -468,9 +470,9 @@ def collect_data():
                 
                 current_cells = bms_data.get('cells', [])
                 for i, v in enumerate(current_cells):
-                    if i < 24 and v > 0.5:
-                        if v < history_data['cell_min_daily'][i]: history_data['cell_min_daily'][i] = v
-                        if v > history_data['cell_max_daily'][i]: history_data['cell_max_daily'][i] = v
+                    if v > 0.5:
+                        if v < cell_daily_stats['min'][i]: cell_daily_stats['min'][i] = v
+                        if v > cell_daily_stats['max'][i]: cell_daily_stats['max'][i] = v
                 
                 v = bms_data.get('voltage', 0)
                 p_pv = bms_data.get('pv_power', 0)
@@ -502,6 +504,7 @@ def collect_data():
                         
                         total_house_consumption = avg_p_pv - avg_p_batt
                         history_data["consumption"].append({"x": now_ms, "y": round(max(0, total_house_consumption))})
+                        
                         history_data["charging"].append({"x": now_ms, "y": round(avg_p_batt) if avg_p_batt > 0 else 0})
 
                 if USE_VICTRON_DAILY_YIELD and mppt_services:
@@ -512,7 +515,7 @@ def collect_data():
                     if (
                         vy_today is not None
                        and vy_yesterday is not None
-                       and now_hour < HISTORY_WINDOW_START_HOUR # Hier Variable nutzen
+                       and now_hour < 4
                        and abs(vy_today - vy_yesterday) < 0.001
                     ):
                        vy_today = 0.0
@@ -690,8 +693,8 @@ class BMSHandler(BaseHTTPRequestHandler):
             "min_cell": minc,
             "max_cell": maxc,
             "cells": d.get('cells', [0.000] * 8),
-            "cell_min_daily": history_data.get('cell_min_daily', [4.5] * 24),
-            "cell_max_daily": history_data.get('cell_max_daily', [0.0] * 24),
+            "cell_min_daily": cell_daily_stats['min'],
+            "cell_max_daily": cell_daily_stats['max'],
             "temperature": d.get('temperature'),
             "pv_voltage": round(d.get('pv_voltage', 0), 1),
             "pv_power": round(d.get('pv_power', 0)),
