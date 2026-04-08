@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# JK-BMS Dashboard – Version 1.0.0 by M. Voege
+# JK-BMS Dashboard – Version 1.0.1 by M.Vöge (mit Chart-Optimierungen)
 # for Venus OS Large 3.7x Raspberry Pi
 # D-Bus-Treiber wird benötigt von https://github.com/mr-manuel/venus-os_dbus-serialbattery
-# Optimiert für Victron Mppt 100/50 und JKBMS B2A8S20P v19
 
 import dbus
 import sys
@@ -22,7 +21,7 @@ from dbus.mainloop.glib import DBusGMainLoop
 
 # ====================================== WARNSTUFEN – HIER ANPASSEN =======================================
 # D-Bus anpassen! Prüfe mit: dbus -y | grep battery
-DASHBOARD_NAME = ""                                     # Dein Tilel Name hier oder mit "" leer lassen
+DASHBOARD_NAME = ""                                     # Tilel
 MAX_PACK_VOLTAGE_WARNING = 29.40                        # Ab dieser Pack-Spannung: rote Warnung + Blinken
 MAX_CELL_VOLTAGE_WARNING = 3.65                         # Ab dieser Zellspannung: Zelle rot + ⚠️
 BALANCING_START_DELTA = 0.005                           # Ab dieser Delta gilt Balancing als aktiv
@@ -31,7 +30,7 @@ LOW_VOLTAGE_WARNING = 24.00                             # Warnung ab dieser Span
 LOW_SOC_WARNING = 25                                    # Warnung ab diesem SOC in % (0 = deaktivieren)
 MIN_CHARGE_CURRENT_FOR_PULSE = 1.0                      # Ladestrom muss mind. X A sein für Puls (Absorption)
 PORT = 99                                               # Webserver-Port (Standard: 99)
-HISTORY_WINDOW_START_HOUR = 4                           # Real Time reset
+HISTORY_WINDOW_START_HOUR = 4                           # Tages Chart Time reset
 TASMOTA_IPS = ["192.168.0.14", "192.168.0.17"]          # Tasmota Geräte – IPs hier eintragen
 # =========================================================================================================
 battery_services = []
@@ -44,7 +43,7 @@ HISTORY_AUTOSAVE_INTERVAL = 300
 
 DEBUG = False # False / True
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 SCRIPT_PATH = os.path.abspath(__file__)
 SCRIPT_NAME = os.path.basename(__file__)
 LOG_FILE = "/var/volatile/tmp/jk_bms_dashboard.log"
@@ -963,7 +962,6 @@ tempBtn.onclick = async () => {{
     }}
 }};
 
-// Automatisches Re-Aktivieren, wenn man zum Tab zurückkehrt (nur im Fullscreen)
 document.addEventListener('visibilitychange', async () => {{
     if ((document.fullscreenElement || document.webkitFullscreenElement) && document.visibilityState === 'visible') {{
         await requestWakeLock();
@@ -992,15 +990,63 @@ function initMpptChart() {{
             {{ label: 'In (W)',     borderColor: '#ff9500', backgroundColor: 'rgba(255,149,0,0.05)', data: [], tension: 0.18, fill: true,  pointRadius: 0.1, borderWidth: 1, yAxisID: 'y1' }}
         ] }},
         options: {{
-        	  animation: false,
+            animation: {{
+                duration: 400,
+                easing: 'easeOutQuart'
+            }},
             maintainAspectRatio: false,
-            events: ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove'],
-            interaction: {{ mode: 'index', intersect: false }},
-            plugins: {{ legend: {{ position: 'top' }} }},
+            interaction: {{
+                mode: 'index',
+                intersect: false
+            }},
+            plugins: {{
+                legend: {{ position: 'top' }},
+                tooltip: {{
+                    enabled: true,
+                    position: 'nearest',
+                    external: function(context) {{
+                        const tooltipModel = context.tooltip;
+                        if (tooltipModel.opacity !== 0) {{
+                            if (window.mpptTimer) clearTimeout(window.mpptTimer);
+                            window.mpptTimer = setTimeout(() => {{
+                                tooltipModel.opacity = 0;
+                                context.chart.setActiveElements([]);
+                                context.chart.update();
+                            }}, 10000); // 10000ms = 10 Sekunden
+                        }}
+                    }},
+                    callbacks: {{
+                        label: function(context) {{
+                            let label = context.dataset.label || '';
+                            let val = context.parsed.y;
+                            let unit = context.dataset.yAxisID === 'y' ? ' V' : ' W';
+                            if (unit === ' W') {{
+                                if (Math.abs(val) >= 1000) return label + ': ' + (val / 1000).toFixed(2) + ' kW';
+                                return label + ': ' + Math.round(val) + ' W';
+                            }}
+                            return label + ': ' + val.toFixed(2) + unit;
+                        }}
+                    }}
+                }}
+            }},
             scales: {{
-                x: {{ type: 'time', time: {{ unit: 'hour', displayFormats: {{ hour: 'HH:mm' }} }}, grid: {{ color: 'rgba(255, 255, 255, 0.02)' }} }},
-                y: {{ position: 'left', min: 0, title: {{ display: true, text: 'Volt' }}, grid: {{ color: 'rgba(255, 255, 255, 0.02)' }} }},
-                y1: {{ position: 'right', min: 0, title: {{ display: true, text: 'Watt' }}, grid: {{ drawOnChartArea: false }} }}
+                x: {{ 
+                    type: 'time', 
+                    time: {{ unit: 'hour', displayFormats: {{ hour: 'HH:mm' }} }}, 
+                    grid: {{ color: 'rgba(255, 255, 255, 0.01)' }} 
+                }},
+                y: {{ 
+                    position: 'left', 
+                    min: 0, 
+                    title: {{ display: true, text: 'Volt' }}, 
+                    grid: {{ color: 'rgba(255, 255, 255, 0.01)' }} 
+                }},
+                y1: {{ 
+                    position: 'right', 
+                    min: 0, 
+                    title: {{ display: true, text: 'Watt' }}, 
+                    grid: {{ drawOnChartArea: false }} 
+                }}
             }}
         }}
     }});
@@ -1367,8 +1413,7 @@ function initHistory30Chart() {{
             labels: [],
             datasets: [
                 {{
-                    label: 'Ertrag',
-                    data: [],
+                    label: 'Ertrag', data: [], 
                     backgroundColor: 'rgba(0, 191, 255, 0.15)',
                     borderColor: '#00bfff',
                     borderWidth: 1,
@@ -1385,64 +1430,50 @@ function initHistory30Chart() {{
             ]
         }},
         options: {{
+            animation: {{
+                duration: 400,
+                easing: 'easeOutQuart'
+            }},
             maintainAspectRatio: false,
-            aspectRatio: 2,
-            plugins: {{ 
-                legend: {{ display: true }},
+            interaction: {{
+                mode: 'index',
+                intersect: false
+            }},
+            plugins: {{
+                legend: {{ position: 'top' }},
                 tooltip: {{
+                    enabled: true,
+                    position: 'nearest',
+                    external: function(context) {{
+                        const tooltipModel = context.tooltip;
+                        if (tooltipModel.opacity !== 0) {{
+                            if (window.historyTimer) clearTimeout(window.historyTimer);
+                            window.historyTimer = setTimeout(() => {{
+                                tooltipModel.opacity = 0;
+                                context.chart.setActiveElements([]);
+                                context.chart.update();
+                            }}, 10000);
+                        }}
+                    }},
                     callbacks: {{
                         label: function(context) {{
                             let label = context.dataset.label || '';
                             let val = context.parsed.y;
-                            if (val >= 1) return label + ': ' + val.toFixed(2) + ' kWh';
-                            return label + ': ' + (val * 1000).toFixed(0) + ' Wh';
+                            if (val >= 1000 || val <= -1000) {{
+                                return label + ': ' + (val / 1000).toFixed(2) + ' k';
+                            }}
+                            return label + ': ' + val.toFixed(2);
                         }}
                     }}
                 }}
             }},
             scales: {{
+                x: {{ 
+                    grid: {{ color: 'rgba(255, 255, 255, 0.01)' }} 
+                }},
                 y: {{ 
-                    type: 'linear',
-                    display: true,
-                    position: 'left',
                     beginAtZero: true,
-                    grace: '5%', 
-                    title: {{ display: true, text: 'Energie' }},
-                    grid: {{ color: 'rgba(255, 255, 255, 0.05)' }},
-                    ticks: {{
-                        precision: 3,
-                        autoSkip: true,
-                        maxTicksLimit: 8,
-                        callback: function(value) {{
-                            if (value === 0) return '0';
-                            if (value >= 1) return value.toFixed(1) + ' kWh';
-                            return (value * 1000).toFixed(0) + ' Wh';
-                        }}
-                    }}
-                }},
-                y1: {{ 
-                    type: 'linear',
-                    display: true,
-                    position: 'right',
-                    beginAtZero: true,
-                    // Koppelung der rechten Achse an die linke Achse
-                    afterDataLimits: axis => {{
-                        axis.min = axis.chart.scales.y.min;
-                        axis.max = axis.chart.scales.y.max;
-                    }},
-                    grid: {{ drawOnChartArea: false }},
-                    title: {{ display: true, text: 'Energie' }},
-                    ticks: {{
-                        precision: 3,
-                        callback: function(value) {{
-                            if (value === 0) return '0';
-                            if (value >= 1) return value.toFixed(1) + ' kWh';
-                            return (value * 1000).toFixed(0) + ' Wh';
-                        }}
-                    }}
-                }},
-                x: {{
-                    grid: {{ color: 'rgba(255, 255, 255, 0.05)' }}
+                    grid: {{ color: 'rgba(255, 255, 255, 0.01)' }} 
                 }}
             }}
         }}
@@ -1453,7 +1484,7 @@ function loadHistory30() {{
     fetch('/history30').then(r => r.json()).then(data => {{
         history30Chart.data.labels = data.map(d => d.day);
         history30Chart.data.datasets[0].data = data.map(d => d.yield);
-        history30Chart.data.datasets[1].data = data.map(d => d.consumption); // <--- WICHTIG
+        history30Chart.data.datasets[1].data = data.map(d => d.consumption);
         history30Chart.update();
     }});
 }}
