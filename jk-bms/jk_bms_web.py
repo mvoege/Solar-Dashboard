@@ -30,8 +30,8 @@ LOW_VOLTAGE_WARNING = 24.00                             # Warnung ab dieser Span
 LOW_SOC_WARNING = 25                                    # Warnung ab diesem SOC in % (0 = deaktivieren)
 MIN_CHARGE_CURRENT_FOR_PULSE = 1.0                      # Ladestrom muss mind. X A sein für Puls (Absorption)
 PORT = 99                                               # Webserver-Port (Standard: 99)
-HISTORY_WINDOW_START_HOUR = 4                           # Tages Chart Time reset
-TASMOTA_IPS = ["192.168.0.14", "192.168.0.17"]          # Tasmota Geräte – IPs hier eintragen
+HISTORY_WINDOW_START_HOUR = 4
+TASMOTA_IPS = ["192.168.0.14", "192.168.0.17"] # Tasmota Geräte – IPs hier eintragen
 # =========================================================================================================
 battery_services = []
 mppt_services = []
@@ -962,6 +962,7 @@ tempBtn.onclick = async () => {{
     }}
 }};
 
+// Automatisches Re-Aktivieren, wenn man zum Tab zurückkehrt (nur im Fullscreen)
 document.addEventListener('visibilitychange', async () => {{
     if ((document.fullscreenElement || document.webkitFullscreenElement) && document.visibilityState === 'visible') {{
         await requestWakeLock();
@@ -1004,12 +1005,14 @@ function initMpptChart() {{
                 tooltip: {{
                     enabled: true,
                     position: 'nearest',
+                    // Automatisches Ausblenden nach 10 Sek
                     external: function(context) {{
                         const tooltipModel = context.tooltip;
                         if (tooltipModel.opacity !== 0) {{
                             if (window.mpptTimer) clearTimeout(window.mpptTimer);
                             window.mpptTimer = setTimeout(() => {{
                                 tooltipModel.opacity = 0;
+                                // Wichtig für Tablets: Aktive Elemente zurücksetzen
                                 context.chart.setActiveElements([]);
                                 context.chart.update();
                             }}, 10000); // 10000ms = 10 Sekunden
@@ -1020,6 +1023,7 @@ function initMpptChart() {{
                             let label = context.dataset.label || '';
                             let val = context.parsed.y;
                             let unit = context.dataset.yAxisID === 'y' ? ' V' : ' W';
+                            
                             if (unit === ' W') {{
                                 if (Math.abs(val) >= 1000) return label + ': ' + (val / 1000).toFixed(2) + ' kW';
                                 return label + ': ' + Math.round(val) + ' W';
@@ -1413,9 +1417,10 @@ function initHistory30Chart() {{
             labels: [],
             datasets: [
                 {{
-                    label: 'Ertrag', data: [], 
-                    backgroundColor: 'rgba(0, 191, 255, 0.15)',
-                    borderColor: '#00bfff',
+                    label: 'Ertrag',
+                    data: [],
+                    backgroundColor: 'rgba(0, 255, 68, 0.15)',
+                    borderColor: '#00ff00',
                     borderWidth: 1,
                     yAxisID: 'y'
                 }},
@@ -1430,50 +1435,64 @@ function initHistory30Chart() {{
             ]
         }},
         options: {{
-            animation: {{
-                duration: 400,
-                easing: 'easeOutQuart'
-            }},
             maintainAspectRatio: false,
-            interaction: {{
-                mode: 'index',
-                intersect: false
-            }},
-            plugins: {{
-                legend: {{ position: 'top' }},
+            aspectRatio: 2,
+            plugins: {{ 
+                legend: {{ display: true }},
                 tooltip: {{
-                    enabled: true,
-                    position: 'nearest',
-                    external: function(context) {{
-                        const tooltipModel = context.tooltip;
-                        if (tooltipModel.opacity !== 0) {{
-                            if (window.historyTimer) clearTimeout(window.historyTimer);
-                            window.historyTimer = setTimeout(() => {{
-                                tooltipModel.opacity = 0;
-                                context.chart.setActiveElements([]);
-                                context.chart.update();
-                            }}, 10000);
-                        }}
-                    }},
                     callbacks: {{
                         label: function(context) {{
                             let label = context.dataset.label || '';
                             let val = context.parsed.y;
-                            if (val >= 1000 || val <= -1000) {{
-                                return label + ': ' + (val / 1000).toFixed(2) + ' k';
-                            }}
-                            return label + ': ' + val.toFixed(2);
+                            if (val >= 1) return label + ': ' + val.toFixed(2) + ' kWh';
+                            return label + ': ' + (val * 1000).toFixed(0) + ' Wh';
                         }}
                     }}
                 }}
             }},
             scales: {{
-                x: {{ 
-                    grid: {{ color: 'rgba(255, 255, 255, 0.01)' }} 
-                }},
                 y: {{ 
+                    type: 'linear',
+                    display: true,
+                    position: 'left',
                     beginAtZero: true,
-                    grid: {{ color: 'rgba(255, 255, 255, 0.01)' }} 
+                    grace: '5%', 
+                    title: {{ display: true, text: 'Energie' }},
+                    grid: {{ color: 'rgba(255, 255, 255, 0.05)' }},
+                    ticks: {{
+                        precision: 3,
+                        autoSkip: true,
+                        maxTicksLimit: 8,
+                        callback: function(value) {{
+                            if (value === 0) return '0';
+                            if (value >= 1) return value.toFixed(1) + ' kWh';
+                            return (value * 1000).toFixed(0) + ' Wh';
+                        }}
+                    }}
+                }},
+                y1: {{ 
+                    type: 'linear',
+                    display: true,
+                    position: 'right',
+                    beginAtZero: true,
+                    // Koppelung der rechten Achse an die linke Achse
+                    afterDataLimits: axis => {{
+                        axis.min = axis.chart.scales.y.min;
+                        axis.max = axis.chart.scales.y.max;
+                    }},
+                    grid: {{ drawOnChartArea: false }},
+                    title: {{ display: true, text: 'Energie' }},
+                    ticks: {{
+                        precision: 3,
+                        callback: function(value) {{
+                            if (value === 0) return '0';
+                            if (value >= 1) return value.toFixed(1) + ' kWh';
+                            return (value * 1000).toFixed(0) + ' Wh';
+                        }}
+                    }}
+                }},
+                x: {{
+                    grid: {{ color: 'rgba(255, 255, 255, 0.05)' }}
                 }}
             }}
         }}
@@ -1484,7 +1503,7 @@ function loadHistory30() {{
     fetch('/history30').then(r => r.json()).then(data => {{
         history30Chart.data.labels = data.map(d => d.day);
         history30Chart.data.datasets[0].data = data.map(d => d.yield);
-        history30Chart.data.datasets[1].data = data.map(d => d.consumption);
+        history30Chart.data.datasets[1].data = data.map(d => d.consumption); // <--- WICHTIG
         history30Chart.update();
     }});
 }}
