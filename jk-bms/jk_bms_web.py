@@ -1005,14 +1005,12 @@ function initMpptChart() {{
                 tooltip: {{
                     enabled: true,
                     position: 'nearest',
-                    // Automatisches Ausblenden nach 10 Sek
                     external: function(context) {{
                         const tooltipModel = context.tooltip;
                         if (tooltipModel.opacity !== 0) {{
                             if (window.mpptTimer) clearTimeout(window.mpptTimer);
                             window.mpptTimer = setTimeout(() => {{
                                 tooltipModel.opacity = 0;
-                                // Wichtig für Tablets: Aktive Elemente zurücksetzen
                                 context.chart.setActiveElements([]);
                                 context.chart.update();
                             }}, 10000); // 10000ms = 10 Sekunden
@@ -1037,13 +1035,13 @@ function initMpptChart() {{
                 x: {{ 
                     type: 'time', 
                     time: {{ unit: 'hour', displayFormats: {{ hour: 'HH:mm' }} }}, 
-                    grid: {{ color: 'rgba(255, 255, 255, 0.01)' }} 
+                    grid: {{ color: 'rgba(255, 255, 255, 0.00)' }} 
                 }},
                 y: {{ 
                     position: 'left', 
                     min: 0, 
                     title: {{ display: true, text: 'Volt' }}, 
-                    grid: {{ color: 'rgba(255, 255, 255, 0.01)' }} 
+                    grid: {{ color: 'rgba(255, 255, 255, 0.03)' }} 
                 }},
                 y1: {{ 
                     position: 'right', 
@@ -1440,6 +1438,21 @@ function initHistory30Chart() {{
             plugins: {{ 
                 legend: {{ display: true }},
                 tooltip: {{
+                    enabled: true,
+                    position: 'nearest',
+                    // Automatisches Ausblenden nach 10 Sek
+                    external: function(context) {{
+                        const tooltipModel = context.tooltip;
+                        if (tooltipModel.opacity !== 0) {{
+                            if (window.historyTimer) clearTimeout(window.historyTimer);
+                            window.historyTimer = setTimeout(() => {{
+                                tooltipModel.opacity = 0;
+                                // Setzt aktive Elemente zurück (wichtig für Tablets)
+                                context.chart.setActiveElements([]);
+                                context.chart.update();
+                            }}, 10000); // 10 Sekunden
+                        }}
+                    }},
                     callbacks: {{
                         label: function(context) {{
                             let label = context.dataset.label || '';
@@ -1458,7 +1471,7 @@ function initHistory30Chart() {{
                     beginAtZero: true,
                     grace: '5%', 
                     title: {{ display: true, text: 'Energie' }},
-                    grid: {{ color: 'rgba(255, 255, 255, 0.05)' }},
+                    grid: {{ color: 'rgba(255, 255, 255, 0.03)' }},
                     ticks: {{
                         precision: 3,
                         autoSkip: true,
@@ -1475,7 +1488,6 @@ function initHistory30Chart() {{
                     display: true,
                     position: 'right',
                     beginAtZero: true,
-                    // Koppelung der rechten Achse an die linke Achse
                     afterDataLimits: axis => {{
                         axis.min = axis.chart.scales.y.min;
                         axis.max = axis.chart.scales.y.max;
@@ -1492,7 +1504,7 @@ function initHistory30Chart() {{
                     }}
                 }},
                 x: {{
-                    grid: {{ color: 'rgba(255, 255, 255, 0.05)' }}
+                    grid: {{ color: 'rgba(255, 255, 255, 0.00)' }}
                 }}
             }}
         }}
