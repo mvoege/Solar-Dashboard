@@ -59,11 +59,16 @@ history_data = {
 }
 bms_data = {}
 data_lock = threading.Lock()
-cell_daily_stats = {
-    'min': [4.5] * 24,
-    'max': [0.0] * 24,
-    'last_reset_day': None
-}
+def ensure_cell_stats():
+    global cell_daily_stats
+    with data_lock:
+        if "cell_stats" not in history_data:
+            history_data["cell_stats"] = {
+                'min': [4.5] * 24,
+                'max': [0.0] * 24,
+                'last_reset_day': None
+            }
+        cell_daily_stats = history_data["cell_stats"]
 last_update = 0
 
 DBUS_CACHE_TTL = 1.0
@@ -452,11 +457,13 @@ def collect_data():
             now_dt = datetime.now()
             reset_id = now_dt.strftime("%Y-%m-%d") if now_dt.hour >= HISTORY_WINDOW_START_HOUR else (now_dt - timedelta(days=1)).strftime("%Y-%m-%d")
             
-            if cell_daily_stats['last_reset_day'] != reset_id:
+            if cell_daily_stats.get('last_reset_day') != reset_id:
                 with data_lock:
-                    cell_daily_stats['min'] = [4.5] * 24
-                    cell_daily_stats['max'] = [0.0] * 24
-                    cell_daily_stats['last_reset_day'] = reset_id
+                    history_data["cell_stats"]['min'] = [4.5] * 24
+                    history_data["cell_stats"]['max'] = [0.0] * 24
+                    history_data["cell_stats"]['last_reset_day'] = reset_id
+                    # Referenz aktualisieren
+                    cell_daily_stats = history_data["cell_stats"]
                 log_message(f"Zell-Tagesstatistik zurückgesetzt für {reset_id}")
 
             if now_dt.year < 2024:
@@ -470,9 +477,11 @@ def collect_data():
                 
                 current_cells = bms_data.get('cells', [])
                 for i, v in enumerate(current_cells):
-                    if v > 0.5:
-                        if v < cell_daily_stats['min'][i]: cell_daily_stats['min'][i] = v
-                        if v > cell_daily_stats['max'][i]: cell_daily_stats['max'][i] = v
+                    if v > 0.5 and i < len(cell_daily_stats['min']):
+                        if v < cell_daily_stats['min'][i]:
+                            cell_daily_stats['min'][i] = v
+                        if v > cell_daily_stats['max'][i]:
+                            cell_daily_stats['max'][i] = v
                 
                 v = bms_data.get('voltage', 0)
                 p_pv = bms_data.get('pv_power', 0)
@@ -1564,6 +1573,7 @@ if __name__ == '__main__':
     signal.signal(signal.SIGTERM, signal_handler)
     load_history()
     cleanup_old_data()
+    ensure_cell_stats()
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()
     try:
