@@ -22,6 +22,7 @@ from dbus.mainloop.glib import DBusGMainLoop
 # ====================================== WARNSTUFEN – HIER ANPASSEN =======================================
 # D-Bus anpassen! Prüfe mit: dbus -y | grep battery
 DASHBOARD_NAME = ""                                     # Tilel
+CELL_COUNT = 8                                          # Anzahl der Zellen 8
 MAX_PACK_VOLTAGE_WARNING = 29.40                        # Ab dieser Pack-Spannung: rote Warnung + Blinken
 MAX_CELL_VOLTAGE_WARNING = 3.65                         # Ab dieser Zellspannung: Zelle rot + ⚠️
 BALANCING_START_DELTA = 0.005                           # Ab dieser Delta gilt Balancing als aktiv
@@ -64,8 +65,8 @@ def ensure_cell_stats():
     with data_lock:
         if "cell_stats" not in history_data:
             history_data["cell_stats"] = {
-                'min': [4.5] * 24,
-                'max': [0.0] * 24,
+                'min': [4.5] * CELL_COUNT,
+                'max': [0.0] * CELL_COUNT,
                 'last_reset_day': None
             }
         cell_daily_stats = history_data["cell_stats"]
@@ -304,7 +305,7 @@ def dbus_poller():
             }
 
             # Zellen einzeln abfragen (Fehlertolerant)
-            for i in range(1, 17):
+            for i in range(1, CELL_COUNT + 1):
                 v = get_dbus_value(f'/Voltages/Cell{i}')
                 if v is not None and isinstance(v, (int, float)) and v > 0.5:
                     temp['cells'].append(round(float(v), 3))
@@ -696,7 +697,7 @@ class BMSHandler(BaseHTTPRequestHandler):
             "delta_color": "#0f0" if delta < 0.020 else "#ff0" if delta < 0.050 else "#f00",
             "min_cell": minc,
             "max_cell": maxc,
-            "cells": d.get('cells', [0.000] * 8),
+            "cells": d.get('cells', [0.000] * CELL_COUNT),
             "cell_min_daily": cell_daily_stats['min'],
             "cell_max_daily": cell_daily_stats['max'],
             "temperature": d.get('temperature'),
