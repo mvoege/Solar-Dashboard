@@ -30,8 +30,8 @@ LOW_VOLTAGE_WARNING = 24.00                             # Warnung ab dieser Span
 LOW_SOC_WARNING = 25                                    # Warnung ab diesem SOC in % (0 = deaktivieren)
 MIN_CHARGE_CURRENT_FOR_PULSE = 1.0                      # Ladestrom muss mind. X A sein für Puls (Absorption)
 PORT = 99                                               # Webserver-Port (Standard: 99)
-HISTORY_WINDOW_START_HOUR = 4
-TASMOTA_IPS = ["192.168.0.14", "192.168.0.17"] # Tasmota Geräte – IPs hier eintragen
+HISTORY_WINDOW_START_HOUR = 4                           # Uhrzeit wann live Werte zurückgesetzt werden soll
+TASMOTA_IPS = ["192.168.0.14", "192.168.0.17"]          # Tasmota Geräte – IPs hier eintragen
 # =========================================================================================================
 battery_services = []
 mppt_services = []
@@ -271,25 +271,25 @@ def get_mppt_daily_yield(day_offset=0):
     return total if total > 0 else None
 
 def dbus_poller():
-    log_message("D-Bus Poller gestartet – robust 2025/26 Version")
+    """Hält die D-Bus-Werte aktuell mit verbessertem Error-Handling."""
+    log_message("D-Bus Poller gestartet – robuste Version")
     last_discovery = time.time()
     error_streak = 0
 
     while True:
         now = time.time()
 
-        # Services **alle 15–25 Sekunden** neu suchen – das ist der wichtigste Fix!
-        if now - last_discovery > 18:
+        # Periodische Neusuche falls Geräte später eingeschaltet werden
+        if now - last_discovery > 60:
             discover_dbus_services()
             last_discovery = now
-            log_message("Periodische Service-Neusuche durchgeführt", "DEBUG")
 
         if not primary_battery_service:
-            log_message("Kein Batterie-Service erkannt → warte + suche neu", "WARNING")
-            time.sleep(4)
+            time.sleep(5)
             continue
 
         try:
+            # Lokaler Puffer, um Teil-Updates zu vermeiden
             temp = {
                 'soc':         get_dbus_value('/Soc'),
                 'voltage':     get_dbus_value('/Dc/0/Voltage'),
@@ -303,17 +303,21 @@ def dbus_poller():
                 'pv_power':    0.0,
             }
 
-            # Zellen – etwas toleranter
-            for i in range(1, 17):  # JK hat oft bis 16–24 Zellen → mehr abfragen schadet nicht
+            # Zellen einzeln abfragen (Fehlertolerant)
+            for i in range(1, 17):
                 v = get_dbus_value(f'/Voltages/Cell{i}')
                 if v is not None and isinstance(v, (int, float)) and v > 0.5:
                     temp['cells'].append(round(float(v), 3))
 
+            # MPPT Daten sammeln
             for svc in mppt_services:
-                v = get_dbus_value('/Pv/V', 0, svc) or get_dbus_value('/Pv/0/V', 0, svc)
-                p = get_dbus_value('/Yield/Power', 0, svc) or get_dbus_value('/Pv/0/P', 0, svc)
-                temp['pv_voltage'] += float(v or 0)
-                temp['pv_power'] += float(p or 0)
+                try:
+                    v = get_dbus_value('/Pv/V', 0, svc) or get_dbus_value('/Pv/0/V', 0, svc)
+                    p = get_dbus_value('/Yield/Power', 0, svc) or get_dbus_value('/Pv/0/P', 0, svc)
+                    temp['pv_voltage'] += float(v or 0)
+                    temp['pv_power'] += float(p or 0)
+                except:
+                    continue
 
             with data_lock:
                 bms_data.update(temp)
@@ -322,23 +326,18 @@ def dbus_poller():
                 last_update = int(time.time() * 1000)
 
             error_streak = 0
-            time.sleep(1.3)   # etwas langsamer → weniger Druck auf dbus bei schwachem Pi
+            time.sleep(1.3)
 
         except Exception as e:
             error_streak += 1
-            log_message(f"Poller-Fehler #{error_streak}: {str(e)}", "ERROR")
-
-            # Bei ≥ 2 Fehlern sofort aggressiv aufräumen
-            if error_streak >= 2:
+            if error_streak >= 3:
+                log_message(f"D-Bus Poller Fehler-Serie: {e}. Bereinige Cache...", "WARNING")
                 with _dbus_cache_lock:
                     _dbus_cache.clear()
                     _dbus_item_cache.clear()
                 discover_dbus_services()
-                last_discovery = now
                 error_streak = 0
-                log_message("Cache + Items komplett gelöscht + Services neu gesucht", "WARNING")
-
-            time.sleep(2.5)
+            time.sleep(2.0)
 
 def load_history():
     global history_data
@@ -410,20 +409,15 @@ def cleanup_old_data():
         return
 
     now = datetime.now()
-    # Deine Logik: Behalte Daten ab heute 4:00 Uhr
     cutoff_dt = now.replace(hour=4, minute=0, second=0, microsecond=0)
 
-    # Wenn es noch vor 4:00 Uhr ist, nimm 4:00 Uhr vom Vortag
     if now < cutoff_dt:
         cutoff_dt = cutoff_dt - timedelta(days=1)
         
     cutoff_ms = int(cutoff_dt.timestamp() * 1000)
     
     with data_lock:
-        # Wir nutzen list(history_data.keys()), um Fehler beim Ändern des Dicts zu vermeiden
         for k in list(history_data.keys()):
-            # WICHTIG: Nur Listen (Voltage, Watt, Consumption) filtern. 
-            # Der 'daily_cache' ist ein dict und wird hier einfach übersprungen.
             if isinstance(history_data[k], list):
                 history_data[k] = [
                     p for p in history_data[k] 
@@ -462,7 +456,6 @@ def collect_data():
                     history_data["cell_stats"]['min'] = [4.5] * 24
                     history_data["cell_stats"]['max'] = [0.0] * 24
                     history_data["cell_stats"]['last_reset_day'] = reset_id
-                    # Referenz aktualisieren
                     cell_daily_stats = history_data["cell_stats"]
                 log_message(f"Zell-Tagesstatistik zurückgesetzt für {reset_id}")
 
@@ -477,7 +470,7 @@ def collect_data():
                 
                 current_cells = bms_data.get('cells', [])
                 for i, v in enumerate(current_cells):
-                    if v > 0.5 and i < len(cell_daily_stats['min']):
+                    if v > 2.0 and i < len(cell_daily_stats['min']):
                         if v < cell_daily_stats['min'][i]:
                             cell_daily_stats['min'][i] = v
                         if v > cell_daily_stats['max'][i]:
@@ -501,20 +494,16 @@ def collect_data():
             now = time.time()
             if now - last_save_time >= 60:
                 if samples:
-                    avg_p_pv = sum(s['p_pv'] for s in samples) / len(samples)
-                    avg_v_pv = sum(s['v_pv'] for s in samples) / len(samples)
-                    avg_p_batt = sum(s['p_batt'] for s in samples) / len(samples)
-                    
+                    avg = {k: sum(s[k] for s in samples) / len(samples) for k in ['p_pv', 'v_pv', 'p_batt']}
                     now_ms = int(now * 1000)
                     
                     with data_lock:
-                        history_data["mppt_pv_power"].append({"x": now_ms, "y": round(avg_p_pv)})
-                        history_data["mppt_pv_voltage"].append({"x": now_ms, "y": round(avg_v_pv, 1)})
+                        history_data["mppt_pv_power"].append({"x": now_ms, "y": round(avg['p_pv'])})
+                        history_data["mppt_pv_voltage"].append({"x": now_ms, "y": round(avg['v_pv'], 1)})
                         
-                        total_house_consumption = avg_p_pv - avg_p_batt
-                        history_data["consumption"].append({"x": now_ms, "y": round(max(0, total_house_consumption))})
-                        
-                        history_data["charging"].append({"x": now_ms, "y": round(avg_p_batt) if avg_p_batt > 0 else 0})
+                        house_cons = max(0, avg['p_pv'] - avg['p_batt'])
+                        history_data["consumption"].append({"x": now_ms, "y": round(house_cons)})
+                        history_data["charging"].append({"x": now_ms, "y": round(max(0, avg['p_batt']))})
 
                 if USE_VICTRON_DAILY_YIELD and mppt_services:
                     vy_today = get_mppt_daily_yield(0)
@@ -556,32 +545,38 @@ class BMSHandler(BaseHTTPRequestHandler):
         return
 
     def proxy_tasmota(self):
-        """Leitet Anfragen an Tasmota-Geräte weiter (Proxy)"""
+        """Proxy für Tasmota-Geräte mit Timeout-Schutz und IP-Whitelist."""
         try:
             path_parts = self.path.split('/')
-            if len(path_parts) < 3:
-                raise ValueError("Keine IP angegeben")
+            if len(path_parts) < 3: return
+            
+            # IP und Kommando extrahieren
             ip = path_parts[2].split('?')[0]
             query = self.path.split('cmd=')[1] if 'cmd=' in self.path else 'Power'
+            
+            # Sicherheitscheck gegen die Whitelist aus den Einstellungen
             if ip not in TASMOTA_IPS:
-                raise ValueError(f"Unbekannte Tasmota-IP: {ip}")
+                log_message(f"Unautorisierter Tasmota-Zugriff auf IP: {ip}", "WARNING")
+                self.send_error(403, "IP not authorized")
+                return
+
             url = f"http://{ip}/cm?cmnd={query}"
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=4) as response:
+            
+            # timeout=2.0 verhindert Blockieren des gesamten Servers bei Offline-Geräten
+            with urllib.request.urlopen(url, timeout=2.0) as response:
                 res_data = response.read()
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(res_data)
+                
+        except (urllib.error.URLError, TimeoutError, Exception) as e:
+            # Lautloser Fail: Das UI bekommt eine gültige Antwort, zeigt aber "Offline"
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(res_data)
-        except Exception as e:
-            log_message(f"Tasmota Proxy Fehler {self.path}: {e}", "ERROR")
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            fallback = {"POWER": "OFF"}
-            if "FriendlyName1" in self.path:
-                fallback["FriendlyName1"] = "Offline"
+            fallback = {"POWER": "OFF", "State": "Offline", "Error": str(e)}
             self.wfile.write(json.dumps(fallback).encode())
 
     def serve_history30(self):
@@ -1571,9 +1566,10 @@ def signal_handler(sig, frame):
 if __name__ == '__main__':
     signal.signal(signal.SIGINT,  signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    load_history()
-    cleanup_old_data()
-    ensure_cell_stats()
+    load_history()       # 1. Lädt bms_history_backup.json von der SD-Karte
+    ensure_cell_stats()  # 2. Verknüpft cell_daily_stats mit den geladenen Daten
+    cleanup_old_data()   # 3. Bereinigt alte Chart-Daten
+    
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()
     try:
