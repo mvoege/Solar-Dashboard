@@ -17,7 +17,7 @@ from datetime import datetime
 # ====================================== KONFIGURATION =======================================
 PORT = 1305
 DASHBOARD_URL = "http://192.168.0.10:99"
-DYN_NAME = "solar.ddnss.de"
+DYN_NAME = "solar.ddnss.eu"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 USERS_FILE = os.path.join(SCRIPT_DIR, "pw.txt")
