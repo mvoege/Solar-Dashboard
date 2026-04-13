@@ -31,7 +31,7 @@ LOW_VOLTAGE_WARNING = 24.00                             # Warnung ab dieser Span
 LOW_SOC_WARNING = 25                                    # Warnung ab diesem SOC in % (0 = deaktivieren)
 MIN_CHARGE_CURRENT_FOR_PULSE = 1.0                      # Ladestrom muss mind. X A sein für Puls (Absorption)
 PORT = 99                                               # Webserver-Port (Standard: 99)
-HISTORY_WINDOW_START_HOUR = 4                           # Uhrzeit wann live Werte zurückgesetzt werden soll
+HISTORY_WINDOW_START_HOUR = 0                           # Uhrzeit wann live Werte zurückgesetzt werden soll
 TASMOTA_IPS = ["192.168.0.14", "192.168.0.17"]          # Tasmota Geräte – IPs hier eintragen
 # =========================================================================================================
 battery_services = []
@@ -1231,7 +1231,7 @@ function updateData() {{
         if (consWh < 1000) {{
             consEl.textContent = Math.round(consWh) + ' Wh';
         }} else {{
-            consEl.textContent = consVal.toFixed(3) + ' kWh';
+            consEl.textContent = consVal.toFixed(2) + ' kWh';
         }}
 
         // Farbe steuern: Grau wenn 0, sonst Rot
@@ -1292,15 +1292,20 @@ function updateData() {{
         const now = Date.now();
         const lastDs = mpptChart.data.datasets[0].data;
         const lastTs = lastDs.length > 0 ? lastDs[lastDs.length - 1].x : 0;
+
+        // Synchroner Push für alle 4 Datensätze
         if (now - lastTs > 55000 || lastDs.length === 0) {{
-            mpptChart.data.datasets[0].data.push({{ x: now, y: data.pv_power || 0 }});
-            mpptChart.data.datasets[1].data.push({{ x: now, y: data.pv_voltage || 0 }});
-            const houseP = (data.pv_power || 0) - (data.battery_power || 0);
-            mpptChart.data.datasets[2].data.push({{ x: now, y: Math.max(0, houseP) }});
-            const pv = data.pv_power || 0;
-            const batt = data.battery_power || 0;
-            const house = pv - batt; // Echter Hausverbrauch
-            mpptChart.data.datasets[2].data.push({{ x: now, y: Math.max(0, house) }});
+            const pvPower = data.pv_power || 0;
+            const pvVoltage = data.pv_voltage || 0;
+            const battPower = data.battery_power || 0;
+            const houseConsumption = Math.max(0, pvPower - battPower);
+
+            // Alle 4 Punkte nutzen die exakt gleiche Konstante 'now'
+            mpptChart.data.datasets[0].data.push({{ x: now, y: pvPower }});
+            mpptChart.data.datasets[1].data.push({{ x: now, y: pvVoltage }});
+            mpptChart.data.datasets[2].data.push({{ x: now, y: houseConsumption }});
+            mpptChart.data.datasets[3].data.push({{ x: now, y: battPower }});
+
             cleanupChartData();
             mpptChart.update('none');
         }}

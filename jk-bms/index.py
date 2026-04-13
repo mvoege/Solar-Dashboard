@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# index.py – Login-Schutz für Solar Dashboard (Fix für Nginx & Real-IP)
+# index.py – Login-Schutz für Solar Dashboard (Zentrale DYN_NAME Konfiguration)
 
 import http.server
 import socketserver
@@ -17,14 +17,14 @@ from datetime import datetime
 # ====================================== KONFIGURATION =======================================
 PORT = 1305
 DASHBOARD_URL = "http://192.168.0.10:99"
-DYN_NAME = "solar.ddnss.eu"
+DYN_NAME = "solar.ddnss.eu"  # <--- Zentrale Domain-Einstellung
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 USERS_FILE = os.path.join(SCRIPT_DIR, "pw.txt")
 LOG_FILE = "/tmp/Solar_login.log"
 failed_attempts = defaultdict(lambda: [0, 0])   # [count, last_attempt_timestamp]
-BLOCK_THRESHOLD = 5                             # Erhöht für mehr Sicherheit gegen Fehl-Bans
-BLOCK_DURATION = 30 * 60                        
+BLOCK_THRESHOLD = 5                             # Fehlversuche bis Sperre
+BLOCK_DURATION = 30 * 60                        # Sperrdauer in Sekunden (30 Min)
 
 ALLOWED_USERS = {}
 
@@ -103,15 +103,17 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
     logged_in_ips = set()
 
     def get_client_ip(self):
+        # Erkennt die echte IP hinter Nginx
         return self.headers.get('X-Real-IP', self.client_address[0])
 
     def is_host_allowed(self):
         host_header = self.headers.get('Host', '').lower().split(':')[0]
         client_ip = self.get_client_ip()
         
-        allowed = [DYN_NAME.lower(), "localhost", "127.0.0.1"]
+        # Erlaubte Hostnamen (basierend auf der zentralen Variable)
+        allowed_hosts = [DYN_NAME.lower(), "localhost", "127.0.0.1"]
         
-        if host_header in allowed or host_header.startswith("192.168."):
+        if host_header in allowed_hosts or host_header.startswith("192.168."):
             return True
             
         failed_attempts[client_ip] = [BLOCK_THRESHOLD, time.time()]
