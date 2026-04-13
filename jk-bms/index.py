@@ -3,6 +3,7 @@
 # index.py – Login-Schutz für Solar Dashboard (Zentrale DYN_NAME Konfiguration)
 
 import http.server
+import secrets
 import socketserver
 import urllib.request
 import urllib.parse
@@ -170,11 +171,19 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
             pwd = params.get('pass', [''])[0]
         except: self.send_login_page("Anfragefehler"); return
 
-        if user in ALLOWED_USERS and pwd == ALLOWED_USERS[user]:
+        stored_password = ALLOWED_USERS.get(user)
+        if stored_password and secrets.compare_digest(pwd, stored_password):
             self.logged_in_ips.add(client_ip)
             failed_attempts[client_ip] = [0, 0]
             log_message(f"LOGIN ERFOLG: {user} ({client_ip})")
-            self.send_response(302); self.send_header('Location', '/'); self.end_headers()
+            
+            # Verbesserter Redirect für Nginx-Umgebungen
+            self.send_response(303) # 303 sagt explizit: "Nutze GET für die nächste Seite"
+            self.send_header('Location', '/')
+            self.send_header('Content-Length', '0')
+            self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+            self.end_headers()
+            return # Wichtig, um die Funktion hier zu beenden
         else:
             failed_attempts[client_ip][0] += 1
             failed_attempts[client_ip][1] = time.time()
@@ -186,19 +195,41 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
     def proxy_to_dashboard(self):
         if "favicon.ico" in self.path:
             self.send_error(404); return
+        
         target = DASHBOARD_URL + self.path
+        
+        # Diese Header dürfen nicht einfach weitergereicht werden (Hop-by-Hop)
+        hop_by_hop = [
+            'connection', 'keep-alive', 'proxy-authenticate', 
+            'proxy-authorization', 'te', 'trailers', 
+            'transfer-encoding', 'upgrade', 'content-length'
+        ]
+        
         try:
-            req = urllib.request.Request(target, method=self.command)
-            for h in ['Accept', 'User-Agent', 'Content-Type', 'Referer']:
-                if val := self.headers.get(h): req.add_header(h, val)
+            # POST-Daten lesen, falls vorhanden
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length) if content_length > 0 else None
+            
+            req = urllib.request.Request(target, data=post_data, method=self.command)
+            
+            # Alle sinnvollen Header vom Client zum Dashboard durchreichen
+            for key, value in self.headers.items():
+                if key.lower() not in hop_by_hop:
+                    req.add_header(key, value)
+            
             with urllib.request.urlopen(req, timeout=15) as resp:
                 self.send_response(resp.code)
+                
+                # Header vom Dashboard zurück zum Client (Nginx -> Browser)
                 for h, v in resp.getheaders():
-                    if h.lower() not in ['content-length', 'connection', 'transfer-encoding']:
+                    if h.lower() not in hop_by_hop:
                         self.send_header(h, v)
                 self.end_headers()
                 self.wfile.write(resp.read())
-        except: self.send_error(502)
+                
+        except Exception as e:
+            log_message(f"PROXY FEHLER bei {self.path}: {e}")
+            self.send_error(502, f"Dashboard-Proxy Fehler: {e}")
 
     def send_login_page(self, error=""):
         self.send_response(200)
