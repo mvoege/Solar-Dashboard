@@ -499,25 +499,30 @@ def collect_data():
                     now_ms = int(now * 1000)
                     
                     with data_lock:
-                        history_data["mppt_pv_power"].append({"x": now_ms, "y": round(avg['p_pv'])})
+                        p_pv = avg['p_pv']
+                        p_batt = avg['p_batt']
+
+                        # Synchronisation mit der Box-Logik: 
+                        # PV-Leistung minus Batterie-Leistung (negativ bei Entladung = Addition)
+                        actual_cons = max(0, p_pv - p_batt) 
+
+                        history_data["mppt_pv_power"].append({"x": now_ms, "y": round(p_pv)})
                         history_data["mppt_pv_voltage"].append({"x": now_ms, "y": round(avg['v_pv'], 1)})
-                        
-                        house_cons = max(0, avg['p_pv'] - avg['p_batt'])
-                        history_data["consumption"].append({"x": now_ms, "y": round(house_cons)})
-                        history_data["charging"].append({"x": now_ms, "y": round(max(0, avg['p_batt']))})
+                        history_data["consumption"].append({"x": now_ms, "y": round(actual_cons)})
+                        history_data["charging"].append({"x": now_ms, "y": round(max(0, p_batt))})
 
                 if USE_VICTRON_DAILY_YIELD and mppt_services:
                     vy_today = get_mppt_daily_yield(0)
                     vy_yesterday = get_mppt_daily_yield(1)
-                   
+                    
                     now_hour = datetime.now().hour
                     if (
                         vy_today is not None
-                       and vy_yesterday is not None
-                       and now_hour < 4
-                       and abs(vy_today - vy_yesterday) < 0.001
+                        and vy_yesterday is not None
+                        and now_hour < 4
+                        and abs(vy_today - vy_yesterday) < 0.001
                     ):
-                       vy_today = 0.0
+                        vy_today = 0.0
 
                     with data_lock:
                         if vy_today is not None:
@@ -528,8 +533,6 @@ def collect_data():
                 cleanup_old_data()
                 samples = []
                 last_save_time = now
-
-            time.sleep(5) 
 
         except Exception as e:
             log_message(f"collect_data Fehler: {e}", "ERROR")
@@ -685,6 +688,12 @@ class BMSHandler(BaseHTTPRequestHandler):
         current_batt = d.get('power', 0)
         house_power = round(max(0, current_pv - current_batt))
 
+        monthly_yield = 0.0
+        if mppt_services:
+            for i in range(30):
+                val = get_mppt_daily_yield(i)
+                if val: monthly_yield += val
+
         data = {
             "soc": d.get('soc', 0),
             "voltage": d.get('voltage', 0),
@@ -705,7 +714,7 @@ class BMSHandler(BaseHTTPRequestHandler):
             "pv_power": round(d.get('pv_power', 0)),
             "daily_pv_yield": round(d.get('daily_pv_yield', 0), 3),
             "daily_consumption": daily_consumption,
-            "yield_yesterday": round(d.get('yield_yesterday', 0), 3)
+            "monthly_yield": round(monthly_yield, 2)
         }
 
         self.send_response(200)
@@ -833,8 +842,8 @@ class BMSHandler(BaseHTTPRequestHandler):
         <div class="info"><span class="info-label">PV (MPPT V)</span><strong id="pv_voltage">0.0 V</strong></div>
         <div class="info"><span class="info-label">PV (MPPT Watt)</span><strong id="pv_power">0 W</strong></div>
         <!-- <div class="info"><span class="info-label">Lade/Entladung</span><strong id="power">0 W</strong></div> -->
-        <div class="info"><span class="info-label">Tagesverbrauch</span><strong id="daily_consumption">0 kWh</strong></div>
-        <div class="info" onclick="toggleYieldDisplay()" style="cursor:pointer"><span class="info-label" id="yield-label">Tagesertrag</span><strong id="daily_pv_yield">0 kWh</strong></div>
+        <div class="info"><span class="info-label">Tagesverbrauch</span><strong id="daily_consumption">0 W</strong></div>
+        <div class="info" onclick="toggleYieldDisplay()" style="cursor:pointer"><span class="info-label" id="yield-label">Tagesertrag</span><strong id="daily_pv_yield">0 W</strong></div>
         <div class="info"><span class="info-label">Balancing</span><strong id="balancing">—</strong></div>
         <div class="info"><span class="info-label">Zellen-Diff</span><strong id="delta">— V</strong></div>
     </div>
@@ -855,46 +864,44 @@ class BMSHandler(BaseHTTPRequestHandler):
 
 <script>
 const MAX_CHART_POINTS = 2000;
-let mpptChart = null;
-let wakeLock = null; // Neu: Speicher für den Screen Lock
-let lastBalancingState = false;
-let showYesterday = false;
-let currentYieldToday = 0;
-let currentYieldYesterday = 0;
-let retryDelay = 1500;
-const MAX_RETRY_DELAY = 10000;
+        let mpptChart = null;
+        let wakeLock = null; 
+        let lastBalancingState = false;
+        let showMonthly = false;
+        let currentYieldToday = 0;
+        let currentMonthlyYield = 0;
+        let retryDelay = 1500;
+        const MAX_RETRY_DELAY = 10000;
 
-// === Wake Lock Funktionen für Android ===
-async function requestWakeLock() {{
-    try {{
-        if ('wakeLock' in navigator) {{
-            wakeLock = await navigator.wakeLock.request('screen');
-            console.log('Wake Lock aktiv');
+        async function requestWakeLock() {{
+            try {{
+                if ('wakeLock' in navigator) {{
+                    wakeLock = await navigator.wakeLock.request('screen');
+                    console.log('Wake Lock aktiv');
+                }}
+            }} catch (err) {{
+                console.error(`${{err.name}}, ${{err.message}}`);
+            }}
         }}
-    }} catch (err) {{
-        console.error(`${{err.name}}, ${{err.message}}`);
-    }}
-}}
 
-function releaseWakeLock() {{
-    if (wakeLock !== null) {{
-        wakeLock.release();
-        wakeLock = null;
-        console.log('Wake Lock freigegeben');
-    }}
-}}
+        function releaseWakeLock() {{
+            if (wakeLock !== null) {{
+                wakeLock.release();
+                wakeLock = null;
+                console.log('Wake Lock freigegeben');
+            }}
+        }}
 
-// Wächter für Fullscreen-Änderungen
-const fullscreenChangeHandler = async () => {{
-    if (document.fullscreenElement || document.webkitFullscreenElement) {{
-        await requestWakeLock();
-    }} else {{
-        releaseWakeLock();
-    }}
-}};
+        const fullscreenChangeHandler = async () => {{
+            if (document.fullscreenElement || document.webkitFullscreenElement) {{
+                await requestWakeLock();
+            }} else {{
+                releaseWakeLock();
+            }}
+        }};
 
-document.addEventListener('fullscreenchange', fullscreenChangeHandler);
-document.addEventListener('webkitfullscreenchange', fullscreenChangeHandler);
+        document.addEventListener('fullscreenchange', fullscreenChangeHandler);
+        document.addEventListener('webkitfullscreenchange', fullscreenChangeHandler);
 
 // === Hover Logik für Buttons ===
 let idleTimer;
@@ -922,24 +929,25 @@ window.addEventListener('touchstart', showControls);
 
 // Restliche Dashboard Logik...
 function toggleYieldDisplay() {{
-    showYesterday = !showYesterday;
-    document.getElementById('yield-label').textContent = 
-        showYesterday ? "Tagesertrag (Gestern)" : "Tagesertrag";
-    updateYieldDisplay();
-}}
+            showMonthly = !showMonthly;
+            document.getElementById('yield-label').textContent = 
+                showMonthly ? "Monatsertrag" : "Tagesertrag";
+            updateYieldDisplay();
+        }}
 
-function updateYieldDisplay() {{
-    const val = showYesterday ? currentYieldYesterday : currentYieldToday;
-    const el = document.getElementById('daily_pv_yield');
-    
-    if (val >= 10)      el.textContent = val.toFixed(1) + ' kWh';
-    else if (val >= 1)  el.textContent = val.toFixed(2) + ' kWh';
-    else                el.textContent = Math.round(val * 1000) + ' Wh';
-    
-    el.style.color = val > 0 
-        ? (showYesterday ? '#ff9500' : '#00ff00') 
-        : 'var(--gray)';
-}}
+        function updateYieldDisplay() {{
+            const isM = showMonthly;
+            const val = isM ? currentMonthlyYield : currentYieldToday;
+            const el = document.getElementById('daily_pv_yield');
+            
+            if (val >= 10)      el.textContent = val.toFixed(1) + ' kW';
+            else if (val >= 1)  el.textContent = val.toFixed(2) + ' kW';
+            else                el.textContent = Math.round(val * 1000) + ' W';
+            
+            el.style.color = val > 0 
+                ? (isM ? '#ff9500' : '#00ff00') 
+                : 'var(--gray)';
+        }}
 
 let theme = localStorage.getItem('theme') || 'dark';
 document.documentElement.setAttribute('data-theme', theme);
@@ -1222,16 +1230,15 @@ function updateData() {{
         document.getElementById('delta').style.color = data.delta_color;
 
         currentYieldToday = data.daily_pv_yield || 0;
-        currentYieldYesterday = data.yield_yesterday || 0;
+        currentMonthlyYield = data.monthly_yield || 0;
         const consVal = data.daily_consumption || 0;
         const consEl = document.getElementById('daily_consumption');
         const consWh = consVal * 1000; //
 
-        // Neue Logik: Unter 1000 Wh -> Anzeige in Wh, ab 1000 Wh -> Anzeige in kWh
         if (consWh < 1000) {{
-            consEl.textContent = Math.round(consWh) + ' Wh';
+            consEl.textContent = Math.round(consWh) + ' W';
         }} else {{
-            consEl.textContent = consVal.toFixed(2) + ' kWh';
+            consEl.textContent = consVal.toFixed(2) + ' kW';
         }}
 
         // Farbe steuern: Grau wenn 0, sonst Rot
@@ -1293,18 +1300,20 @@ function updateData() {{
         const lastDs = mpptChart.data.datasets[0].data;
         const lastTs = lastDs.length > 0 ? lastDs[lastDs.length - 1].x : 0;
 
-        // Synchroner Push für alle 4 Datensätze
-        if (now - lastTs > 55000 || lastDs.length === 0) {{
-            const pvPower = data.pv_power || 0;
-            const pvVoltage = data.pv_voltage || 0;
-            const battPower = data.battery_power || 0;
-            const houseConsumption = Math.max(0, pvPower - battPower);
+        if (now - lastTs > 60000 || lastDs.length === 0) {{
+            const pwr_pv = data.pv_power || 0;
+            const pwr_batt = data.battery_power || 0;
+            const pwr_cons = Math.max(0, pwr_pv - pwr_batt); 
 
-            // Alle 4 Punkte nutzen die exakt gleiche Konstante 'now'
-            mpptChart.data.datasets[0].data.push({{ x: now, y: pvPower }});
-            mpptChart.data.datasets[1].data.push({{ x: now, y: pvVoltage }});
-            mpptChart.data.datasets[2].data.push({{ x: now, y: houseConsumption }});
-            mpptChart.data.datasets[3].data.push({{ x: now, y: battPower }});
+            mpptChart.data.datasets[0].data.push({{ x: now, y: pwr_pv }});
+            mpptChart.data.datasets[1].data.push({{ x: now, y: data.pv_voltage || 0 }});
+            mpptChart.data.datasets[2].data.push({{ x: now, y: pwr_cons }});
+            mpptChart.data.datasets[3].data.push({{ x: now, y: pwr_batt }});
+
+            // Verhindert das Explodieren der Datenmenge im Browser-RAM
+            if (mpptChart.data.datasets[0].data.length > MAX_CHART_POINTS) {{
+                mpptChart.data.datasets.forEach(ds => ds.data.shift());
+            }}
 
             cleanupChartData();
             mpptChart.update('none');
@@ -1467,8 +1476,8 @@ function initHistory30Chart() {{
                         label: function(context) {{
                             let label = context.dataset.label || '';
                             let val = context.parsed.y;
-                            if (val >= 1) return label + ': ' + val.toFixed(2) + ' kWh';
-                            return label + ': ' + (val * 1000).toFixed(0) + ' Wh';
+                            if (val >= 1) return label + ': ' + val.toFixed(2) + ' kW';
+                            return label + ': ' + (val * 1000).toFixed(0) + ' W';
                         }}
                     }}
                 }}
@@ -1488,8 +1497,8 @@ function initHistory30Chart() {{
                         maxTicksLimit: 8,
                         callback: function(value) {{
                             if (value === 0) return '0';
-                            if (value >= 1) return value.toFixed(1) + ' kWh';
-                            return (value * 1000).toFixed(0) + ' Wh';
+                            if (value >= 1) return value.toFixed(1) + ' kW';
+                            return (value * 1000).toFixed(0) + ' W';
                         }}
                     }}
                 }},
@@ -1508,8 +1517,8 @@ function initHistory30Chart() {{
                         precision: 3,
                         callback: function(value) {{
                             if (value === 0) return '0';
-                            if (value >= 1) return value.toFixed(1) + ' kWh';
-                            return (value * 1000).toFixed(0) + ' Wh';
+                            if (value >= 1) return value.toFixed(1) + ' kW';
+                            return (value * 1000).toFixed(0) + ' W';
                         }}
                     }}
                 }},
