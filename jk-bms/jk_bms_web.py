@@ -827,23 +827,23 @@ class BMSHandler(BaseHTTPRequestHandler):
     <div class="low-soc-warning" id="low-soc-warning">⚠️ Batterie fast leer! (≤ {LOW_SOC_WARNING}%) ⚠️</div>
 
     <div class="main-grid">
-        <div class="box"><div class="big" id="voltage">{volt_init:.2f}</div><div class="label">Batterie Spannung (Volt)</div></div>
-        <div class="box"><div class="big" id="soc">{soc_init:.0f}<span>%</span></div><div class="label">Ladezustand (SoC)</div></div>
+        <div class="box"><div class="big" id="voltage">{volt_init:.2f}</div><div class="label">⚡ Batterie Spannung (Volt)</div></div>
+        <div class="box"><div class="big" id="soc">{soc_init:.0f}<span>%</span></div><div class="label">🔋 Ladezustand (SoC)</div></div>
         <div class="box">
             <div style="display: flex; justify-content: space-between; font-size:1.1rem; margin-top: 5px; color: #888; border-top: 1px solid #444; padding-top: 3px;">
-                <span style="color: var(--gray);">Solar:</span>
+                <span style="color: var(--gray);">☀️ Solar:</span>
                 <span id="amp-solar">0.00 A | 0 W</span>
             </div>
             <div style="display: flex; justify-content: space-between; font-size:1.1rem; margin-top: 5px; color: #888; border-top: 1px solid #444; padding-top: 3px;">
-                <span style="color: var(--gray);">Ladung:</span>
+                <span style="color: var(--gray);">📥 Ladung:</span>
                 <span id="amp-battery">0.00 A | 0 W</span>
             </div>
             <div style="display: flex; justify-content: space-between; font-size:1.1rem; margin-top: 5px; color: #888; border-top: 1px solid #444; padding-top: 3px;">
-                <span style="color: var(--gray);">Verbrauch:</span>
+                <span style="color: var(--gray);">🏠 Verbrauch:</span>
                 <span id="amp-consumption">0.00 A | 0 W</span>
             </div>
             <div style="display: flex; justify-content: space-between; font-size:1.1rem; margin-top: 5px; color: #888; border-top: 1px solid #444; padding-top: 3px;">
-                <span style="color: var(--gray);">Lade/Entladung:</span>
+                <span style="color: var(--gray);">🔄 Lade/Entladung:</span>
                 <span id="power">0 W</span>
             </div>
         </div>
@@ -870,7 +870,7 @@ class BMSHandler(BaseHTTPRequestHandler):
         </div>
     </div>
 
-    <div class="footer">JK-BMS Dashboard {VERSION} © by M.Vöge – Läuft seit: <span id="uptime">00:00:00</span></div>
+    <div class="footer">Solar Dashboard {VERSION} – Datum:<span id="current-date">00.00.0000</span> – Läuft seit: <span id="uptime">00:00:00</span> Stunden</div>
 </div>
 
 <script>
@@ -1015,7 +1015,15 @@ document.addEventListener('visibilitychange', async () => {{
 
 const startTime = {start_ts};
 function updateUptime() {{
-    let s = Math.floor((Date.now() - startTime) / 1000);
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('de-DE', {{ 
+        day: '2-digit', 
+        month: '2-digit', 
+        year: 'numeric' 
+    }});
+    document.getElementById('current-date').textContent = dateStr;
+
+    let s = Math.floor((now.getTime() - startTime) / 1000);
     let h = Math.floor(s / 3600).toString().padStart(2, '0');
     let m = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
     let sec = (s % 60).toString().padStart(2, '0');
