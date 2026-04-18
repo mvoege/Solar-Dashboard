@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# JK-BMS Dashboard – Version 1.0.1 by M.Vöge (mit Chart-Optimierungen)
+# JK-BMS Dashboard – Version 1.0.2 © by M.Vöge
 # for Venus OS Large 3.7x Raspberry Pi
 # D-Bus-Treiber wird benötigt von https://github.com/mr-manuel/venus-os_dbus-serialbattery
 
@@ -29,7 +29,6 @@ BALANCING_START_DELTA = 0.005                           # Ab dieser Delta gilt B
 BALANCING_START_VOLTAGE = 3.40                          # Ab dieser Wert wird Balancing als aktiv
 LOW_VOLTAGE_WARNING = 24.00                             # Warnung ab dieser Spannung (0.0 = deaktivieren)
 LOW_SOC_WARNING = 25                                    # Warnung ab diesem SOC in % (0 = deaktivieren)
-MIN_CHARGE_CURRENT_FOR_PULSE = 1.0                      # Ladestrom muss mind. X A sein für Puls (Absorption)
 PORT = 99                                               # Webserver-Port (Standard: 99)
 HISTORY_WINDOW_START_HOUR = 0                           # Uhrzeit wann live Werte zurückgesetzt werden soll
 TASMOTA_IPS = ["192.168.0.14", "192.168.0.17"]          # Tasmota Geräte – IPs hier eintragen
@@ -44,7 +43,7 @@ HISTORY_AUTOSAVE_INTERVAL = 300
 
 DEBUG = False # False / True
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 SCRIPT_PATH = os.path.abspath(__file__)
 SCRIPT_NAME = os.path.basename(__file__)
 LOG_FILE = "/var/volatile/tmp/jk_bms_dashboard.log"
@@ -410,7 +409,7 @@ def cleanup_old_data():
         return
 
     now = datetime.now()
-    cutoff_dt = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    cutoff_dt = now.replace(hour=HISTORY_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
 
     if now < cutoff_dt:
         cutoff_dt = cutoff_dt - timedelta(days=1)
@@ -501,9 +500,6 @@ def collect_data():
                     with data_lock:
                         p_pv = avg['p_pv']
                         p_batt = avg['p_batt']
-
-                        # Synchronisation mit der Box-Logik: 
-                        # PV-Leistung minus Batterie-Leistung (negativ bei Entladung = Addition)
                         actual_cons = max(0, p_pv - p_batt) 
 
                         history_data["mppt_pv_power"].append({"x": now_ms, "y": round(p_pv)})
@@ -519,7 +515,7 @@ def collect_data():
                     if (
                         vy_today is not None
                         and vy_yesterday is not None
-                        and now_hour < 4
+                        and now_hour < HISTORY_WINDOW_START_HOUR
                         and abs(vy_today - vy_yesterday) < 0.001
                     ):
                         vy_today = 0.0
@@ -689,10 +685,24 @@ class BMSHandler(BaseHTTPRequestHandler):
         house_power = round(max(0, current_pv - current_batt))
 
         monthly_yield = 0.0
+        monthly_consumption = 0.0 # Immer initialisieren
+        
+        with data_lock:
+            if "daily_cache" not in history_data:
+                history_data["daily_cache"] = {}
+            daily_cache = history_data["daily_cache"].copy()
+
         if mppt_services:
             for i in range(30):
-                val = get_mppt_daily_yield(i)
-                if val: monthly_yield += val
+                y_val = get_mppt_daily_yield(i)
+                if y_val: monthly_yield += y_val
+                
+                target_date = datetime.now() - timedelta(days=i)
+                day_str = target_date.strftime("%d.%m.")
+                if i == 0:
+                    monthly_consumption += daily_consumption
+                else:
+                    monthly_consumption += daily_cache.get(day_str, 0)
 
         data = {
             "soc": d.get('soc', 0),
@@ -714,6 +724,7 @@ class BMSHandler(BaseHTTPRequestHandler):
             "pv_power": round(d.get('pv_power', 0)),
             "daily_pv_yield": round(d.get('daily_pv_yield', 0), 3),
             "daily_consumption": daily_consumption,
+            "monthly_consumption": round(monthly_consumption, 3),
             "monthly_yield": round(monthly_yield, 2)
         }
 
@@ -842,8 +853,8 @@ class BMSHandler(BaseHTTPRequestHandler):
         <div class="info"><span class="info-label">PV (MPPT V)</span><strong id="pv_voltage">0.0 V</strong></div>
         <div class="info"><span class="info-label">PV (MPPT Watt)</span><strong id="pv_power">0 W</strong></div>
         <!-- <div class="info"><span class="info-label">Lade/Entladung</span><strong id="power">0 W</strong></div> -->
-        <div class="info"><span class="info-label">Tagesverbrauch</span><strong id="daily_consumption">0 W</strong></div>
         <div class="info" onclick="toggleYieldDisplay()" style="cursor:pointer"><span class="info-label" id="yield-label">Tagesertrag</span><strong id="daily_pv_yield">0 W</strong></div>
+        <div class="info" onclick="toggleConsumptionDisplay()" style="cursor:pointer"><span class="info-label" id="consumption-label">Tagesverbrauch</span><strong id="daily_consumption">0 W</strong></div>
         <div class="info"><span class="info-label">Balancing</span><strong id="balancing">—</strong></div>
         <div class="info"><span class="info-label">Zellen-Diff</span><strong id="delta">— V</strong></div>
     </div>
@@ -859,51 +870,53 @@ class BMSHandler(BaseHTTPRequestHandler):
         </div>
     </div>
 
-    <div class="footer">JK-BMS Dashboard {VERSION} – Läuft seit: <span id="uptime">00:00:00</span></div>
+    <div class="footer">JK-BMS Dashboard {VERSION} © by M.Vöge – Läuft seit: <span id="uptime">00:00:00</span></div>
 </div>
 
 <script>
 const MAX_CHART_POINTS = 2000;
-        let mpptChart = null;
-        let wakeLock = null; 
-        let lastBalancingState = false;
-        let showMonthly = false;
-        let currentYieldToday = 0;
-        let currentMonthlyYield = 0;
-        let retryDelay = 1500;
-        const MAX_RETRY_DELAY = 10000;
+let mpptChart = null;
+let wakeLock = null; 
+let lastBalancingState = false;
+let showMonthly = false;
+let showMonthlyCons = false;
+let currentYieldToday = 0;
+let currentMonthlyYield = 0;
+let currentConsToday = 0;
+let currentMonthlyCons = 0;
+let retryDelay = 1500;
+const MAX_RETRY_DELAY = 10000;
 
-        async function requestWakeLock() {{
-            try {{
-                if ('wakeLock' in navigator) {{
-                    wakeLock = await navigator.wakeLock.request('screen');
-                    console.log('Wake Lock aktiv');
-                }}
-            }} catch (err) {{
-                console.error(`${{err.name}}, ${{err.message}}`);
-            }}
+async function requestWakeLock() {{
+    try {{
+        if ('wakeLock' in navigator) {{
+            wakeLock = await navigator.wakeLock.request('screen');
+            console.log('Wake Lock aktiv');
         }}
+    }} catch (err) {{
+        console.error(`${{err.name}}, ${{err.message}}`);
+    }}
+}}
 
-        function releaseWakeLock() {{
-            if (wakeLock !== null) {{
-                wakeLock.release();
-                wakeLock = null;
-                console.log('Wake Lock freigegeben');
-            }}
-        }}
+function releaseWakeLock() {{
+    if (wakeLock !== null) {{
+        wakeLock.release();
+        wakeLock = null;
+        console.log('Wake Lock freigegeben');
+    }}
+}}
 
-        const fullscreenChangeHandler = async () => {{
-            if (document.fullscreenElement || document.webkitFullscreenElement) {{
-                await requestWakeLock();
-            }} else {{
-                releaseWakeLock();
-            }}
-        }};
+const fullscreenChangeHandler = async () => {{
+    if (document.fullscreenElement || document.webkitFullscreenElement) {{
+        await requestWakeLock();
+    }} else {{
+        releaseWakeLock();
+    }}
+}};
 
-        document.addEventListener('fullscreenchange', fullscreenChangeHandler);
-        document.addEventListener('webkitfullscreenchange', fullscreenChangeHandler);
+document.addEventListener('fullscreenchange', fullscreenChangeHandler);
+document.addEventListener('webkitfullscreenchange', fullscreenChangeHandler);
 
-// === Hover Logik für Buttons ===
 let idleTimer;
 const themeBtn = document.getElementById('theme-toggle');
 const tempBtn = document.getElementById('temp-circle');
@@ -914,14 +927,14 @@ function showControls() {{
     if (document.getElementById('temperature').textContent !== '—') {{
         tempBtn.classList.add('controls-visible');
     }}
-    document.querySelectorAll('.tasmota-circle').forEach(el => el.classList.add('controls-visible'));  // ← neu
-    
+    document.querySelectorAll('.tasmota-circle').forEach(el => el.classList.add('controls-visible'));
+
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {{
         themeBtn.classList.remove('controls-visible');
         tempBtn.classList.remove('controls-visible');
-        document.querySelectorAll('.tasmota-circle').forEach(el => el.classList.remove('controls-visible'));  // ← neu
-    }}, 3500);  // ← Timeout auf 3500 erhöht für mehr Platz
+        document.querySelectorAll('.tasmota-circle').forEach(el => el.classList.remove('controls-visible'));
+    }}, 3500);
 }}
 
 window.addEventListener('mousemove', showControls);
@@ -929,25 +942,44 @@ window.addEventListener('touchstart', showControls);
 
 // Restliche Dashboard Logik...
 function toggleYieldDisplay() {{
-            showMonthly = !showMonthly;
-            document.getElementById('yield-label').textContent = 
-                showMonthly ? "Monatsertrag" : "Tagesertrag";
-            updateYieldDisplay();
-        }}
+    showMonthly = !showMonthly;
+    document.getElementById('yield-label').textContent = 
+        showMonthly ? "Monatsertrag" : "Tagesertrag";
+    updateYieldDisplay();
+}}
 
-        function updateYieldDisplay() {{
-            const isM = showMonthly;
-            const val = isM ? currentMonthlyYield : currentYieldToday;
-            const el = document.getElementById('daily_pv_yield');
-            
-            if (val >= 10)      el.textContent = val.toFixed(1) + ' kW';
-            else if (val >= 1)  el.textContent = val.toFixed(2) + ' kW';
-            else                el.textContent = Math.round(val * 1000) + ' W';
-            
-            el.style.color = val > 0 
-                ? (isM ? '#ff9500' : '#00ff00') 
-                : 'var(--gray)';
-        }}
+function updateYieldDisplay() {{
+    const isM = showMonthly;
+    const val = isM ? currentMonthlyYield : currentYieldToday;
+    const el = document.getElementById('daily_pv_yield');
+
+    if (val >= 10)      el.textContent = val.toFixed(1) + ' kW';
+    else if (val >= 1)  el.textContent = val.toFixed(2) + ' kW';
+    else                el.textContent = Math.round(val * 1000) + ' W';
+
+    el.style.color = val > 0 ? (isM ? '#ff9500' : '#00ff00') : 'var(--gray)';
+}}
+
+function toggleConsumptionDisplay() {{
+    showMonthlyCons = !showMonthlyCons;
+    document.getElementById('consumption-label').textContent = 
+        showMonthlyCons ? "Monatsverbrauch" : "Tagesverbrauch";
+    updateConsumptionDisplay();
+}}
+
+function updateConsumptionDisplay() {{
+    const isM = showMonthlyCons;
+    const val = isM ? currentMonthlyCons : currentConsToday;
+    const el = document.getElementById('daily_consumption');
+
+    const valWh = val * 1000;
+    if (valWh < 1000) {{
+    el.textContent = Math.round(valWh) + ' W';
+    }} else {{
+    el.textContent = val.toFixed(2) + ' kW';
+    }}
+    el.style.color = val > 0.001 ? (isM ? '#ff9500' : '#f00') : 'var(--gray)';
+}}
 
 let theme = localStorage.getItem('theme') || 'dark';
 document.documentElement.setAttribute('data-theme', theme);
@@ -975,7 +1007,6 @@ tempBtn.onclick = async () => {{
     }}
 }};
 
-// Automatisches Re-Aktivieren, wenn man zum Tab zurückkehrt (nur im Fullscreen)
 document.addEventListener('visibilitychange', async () => {{
     if ((document.fullscreenElement || document.webkitFullscreenElement) && document.visibilityState === 'visible') {{
         await requestWakeLock();
@@ -1070,7 +1101,7 @@ function initMpptChart() {{
 function cleanupChartData() {{
     const now = new Date();
     let cutoffDate = new Date();
-    cutoffDate.setHours(4, 0, 0, 0);
+    cutoffDate.setHours({HISTORY_WINDOW_START_HOUR}, 0, 0, 0); 
     if (now < cutoffDate) {{
         cutoffDate.setDate(cutoffDate.getDate() - 1);
     }}
@@ -1157,7 +1188,7 @@ function updateData() {{
         const socEl = document.getElementById('soc');
         socEl.innerHTML = s.toFixed(0) + '<span>%</span>';
         socEl.style.color = s >= 95 ? '#0f0' : s >= 70 ? '#ff0' : s >= 40 ? '#ff9500' : '#f00';
-        socEl.style.animation = s <= 25 ? 'blink 1s infinite' : (data.current >= {MIN_CHARGE_CURRENT_FOR_PULSE}) ? 'blink 3s infinite ease-in-out' : 'none';
+        socEl.style.animation = s <= 25 ? 'blink 1s infinite' : 'none';
 
         if (v > 1.0) {{
             hv_warn.style.display = v >= {MAX_PACK_VOLTAGE_WARNING} ? 'block' : 'none';
@@ -1231,23 +1262,11 @@ function updateData() {{
 
         currentYieldToday = data.daily_pv_yield || 0;
         currentMonthlyYield = data.monthly_yield || 0;
-        const consVal = data.daily_consumption || 0;
-        const consEl = document.getElementById('daily_consumption');
-        const consWh = consVal * 1000; //
-
-        if (consWh < 1000) {{
-            consEl.textContent = Math.round(consWh) + ' W';
-        }} else {{
-            consEl.textContent = consVal.toFixed(2) + ' kW';
-        }}
-
-        // Farbe steuern: Grau wenn 0, sonst Rot
-        if (consVal <= 0.001) {{
-            consEl.style.color = 'var(--gray)';
-        }} else {{
-            consEl.style.color = '#f00';
-        }}
+        currentConsToday = data.daily_consumption || 0;
+        currentMonthlyCons = data.monthly_consumption || 0;
+        
         updateYieldDisplay();
+        updateConsumptionDisplay();
 
         if (data.temperature !== null && data.temperature > -40) {{
             document.getElementById('temperature').textContent = Math.round(data.temperature) + '°';
@@ -1310,7 +1329,6 @@ function updateData() {{
             mpptChart.data.datasets[2].data.push({{ x: now, y: pwr_cons }});
             mpptChart.data.datasets[3].data.push({{ x: now, y: pwr_batt }});
 
-            // Verhindert das Explodieren der Datenmenge im Browser-RAM
             if (mpptChart.data.datasets[0].data.length > MAX_CHART_POINTS) {{
                 mpptChart.data.datasets.forEach(ds => ds.data.shift());
             }}
