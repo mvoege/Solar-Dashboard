@@ -49,6 +49,7 @@ SCRIPT_NAME = os.path.basename(__file__)
 LOG_FILE = "/var/volatile/tmp/jk_bms_dashboard.log"
 HISTORY_FILE = "/var/volatile/tmp/bms_history.json"
 HISTORY_BACKUP_FILE = "/data/apps/jk-bms/bms_history_backup.json"
+STATS_FILE = "/data/apps/jk-bms/bms_stats.json"
 
 server_start_time = None
 history_data = {
@@ -80,7 +81,6 @@ def log_message(message, level="INFO"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     full = f"[{timestamp}] [{level}] {message}"
     try:
-        # Rotations-Check: Wenn Log > 1MB, Datei leeren
         if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 1024 * 1024:
             with open(LOG_FILE, 'w') as f:
                 f.write(f"[{timestamp}] [INFO] Log rotiert (Größe überschritten)\n")
@@ -279,7 +279,6 @@ def dbus_poller():
     while True:
         now = time.time()
 
-        # Periodische Neusuche falls Geräte später eingeschaltet werden
         if now - last_discovery > 60:
             discover_dbus_services()
             last_discovery = now
@@ -289,27 +288,12 @@ def dbus_poller():
             continue
 
         try:
-            # Lokaler Puffer, um Teil-Updates zu vermeiden
             temp = {
-                'soc':         get_dbus_value('/Soc'),
-                'voltage':     get_dbus_value('/Dc/0/Voltage'),
-                'current':     get_dbus_value('/Dc/0/Current'),
-                'power':       get_dbus_value('/Dc/0/Power'),
-                'temperature': get_dbus_value('/Dc/0/Temperature'),
-                'min_cell':    get_dbus_value('/System/MinCellVoltage'),
-                'max_cell':    get_dbus_value('/System/MaxCellVoltage'),
-                'cells':       [],
-                'pv_voltage':  0.0,
-                'pv_power':    0.0,
+                'cells': [],
+                'pv_voltage': 0.0,
+                'pv_power': 0.0,
             }
 
-            # Zellen einzeln abfragen (Fehlertolerant)
-            for i in range(1, CELL_COUNT + 1):
-                v = get_dbus_value(f'/Voltages/Cell{i}')
-                if v is not None and isinstance(v, (int, float)) and v > 0.5:
-                    temp['cells'].append(round(float(v), 3))
-
-            # MPPT Daten sammeln
             for svc in mppt_services:
                 try:
                     v = get_dbus_value('/Pv/V', 0, svc) or get_dbus_value('/Pv/0/V', 0, svc)
@@ -319,6 +303,19 @@ def dbus_poller():
                 except:
                     continue
 
+            temp['power']   = get_dbus_value('/Dc/0/Power')
+            temp['current'] = get_dbus_value('/Dc/0/Current')
+            temp['soc']         = get_dbus_value('/Soc')
+            temp['voltage']     = get_dbus_value('/Dc/0/Voltage')
+            temp['temperature'] = get_dbus_value('/Dc/0/Temperature')
+            temp['min_cell']    = get_dbus_value('/System/MinCellVoltage')
+            temp['max_cell']    = get_dbus_value('/System/MaxCellVoltage')
+
+            for i in range(1, CELL_COUNT + 1):
+                v = get_dbus_value(f'/Voltages/Cell{i}')
+                if v is not None and isinstance(v, (int, float)) and v > 0.5:
+                    temp['cells'].append(round(float(v), 3))
+
             with data_lock:
                 bms_data.update(temp)
                 bms_data["dbus_ok"] = dbus_available
@@ -326,7 +323,8 @@ def dbus_poller():
                 last_update = int(time.time() * 1000)
 
             error_streak = 0
-            time.sleep(1.3)
+            # Verkürzt auf 0.7 Sekunden für schnellere Synchronisation
+            time.sleep(0.7)
 
         except Exception as e:
             error_streak += 1
@@ -352,44 +350,57 @@ def load_history():
                 log_message(f"Lade Backup aus /data (Alter: {int(age)}s)")
             else:
                 log_message(f"Backup in /data zu alt ({int(age)}s), wird ignoriert.")
-                return
         else:
-            return
+            source = None
 
-    try:
-        with open(source, "r") as f:
-            loaded = json.load(f)
-            if isinstance(loaded, dict) and "mppt_pv_power" in loaded:
+    if source:
+        try:
+            with open(source, "r") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict) and "mppt_pv_power" in loaded:
+                    with data_lock:
+                        history_data = loaded
+                    log_message(f"History erfolgreich aus {source} geladen.")
+        except Exception as e:
+            log_message(f"History Laden Fehler: {e}", "ERROR")
+
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, "r") as f:
+                stats = json.load(f)
                 with data_lock:
-                    history_data = loaded
-                log_message(f"History erfolgreich aus {source} geladen.")
-    except Exception as e:
-        log_message(f"History Laden Fehler: {e}", "ERROR")
+                    history_data["daily_cache"] = stats
+                log_message("Langzeit-Statistiken (daily_cache) geladen.")
+        except Exception as e:
+            log_message(f"Fehler beim Laden der Stats: {e}")
 
 def save_history(backup=False):
     """
-    Speichert atomar ins RAM. Wenn backup=True, auch permanent nach /data.
+    Speichert Daten atomar. 24h-Chart bleibt kompakt, 
+    Monats-Statistiken werden lesbar (untereinander) gespeichert.
     """
     try:
         with data_lock:
             if not any(history_data.values()): return
-            data_str = json.dumps(history_data, separators=(',', ':'), ensure_ascii=False)
+            
+            chart_data = {k: v for k, v in history_data.items() if k != "daily_cache"}
+            stats_data = history_data.get("daily_cache", {})
 
-        targets = [HISTORY_FILE]
-        if backup:
-            targets.append(HISTORY_BACKUP_FILE)
-
-        for path in targets:
+        for path in ([HISTORY_FILE, HISTORY_BACKUP_FILE] if backup else [HISTORY_FILE]):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = path + ".tmp"
             with open(tmp, "w") as f:
-                f.write(data_str)
+                json.dump(chart_data, f, separators=(',', ':'))
             os.replace(tmp, path)
-        
-        if DEBUG:
-            log_message(f"History gesichert (Permanent-Backup: {backup})")
+
+        os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
+        tmp_s = STATS_FILE + ".tmp"
+        with open(tmp_s, "w") as f:
+            json.dump(stats_data, f, indent=4, ensure_ascii=False)
+        os.replace(tmp_s, STATS_FILE)
+
     except Exception as e:
-        log_message(f"Fehler beim Speichern: {e}", "ERROR")
+        log_message(f"Speicherfehler: {e}", "ERROR")
 
 def get_history_window():
     now = datetime.now()
@@ -550,11 +561,9 @@ class BMSHandler(BaseHTTPRequestHandler):
             path_parts = self.path.split('/')
             if len(path_parts) < 3: return
             
-            # IP und Kommando extrahieren
             ip = path_parts[2].split('?')[0]
             query = self.path.split('cmd=')[1] if 'cmd=' in self.path else 'Power'
             
-            # Sicherheitscheck gegen die Whitelist aus den Einstellungen
             if ip not in TASMOTA_IPS:
                 log_message(f"Unautorisierter Tasmota-Zugriff auf IP: {ip}", "WARNING")
                 self.send_error(403, "IP not authorized")
@@ -562,7 +571,6 @@ class BMSHandler(BaseHTTPRequestHandler):
 
             url = f"http://{ip}/cm?cmnd={query}"
             
-            # timeout=2.0 verhindert Blockieren des gesamten Servers bei Offline-Geräten
             with urllib.request.urlopen(url, timeout=2.0) as response:
                 res_data = response.read()
                 self.send_response(200)
@@ -572,7 +580,6 @@ class BMSHandler(BaseHTTPRequestHandler):
                 self.wfile.write(res_data)
                 
         except (urllib.error.URLError, TimeoutError, Exception) as e:
-            # Lautloser Fail: Das UI bekommt eine gültige Antwort, zeigt aber "Offline"
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
@@ -585,7 +592,6 @@ class BMSHandler(BaseHTTPRequestHandler):
         now = datetime.now()
         
         with data_lock:
-            # Sicherstellen, dass der Cache existiert
             if "daily_cache" not in history_data:
                 history_data["daily_cache"] = {}
             cons_history = list(history_data.get("consumption", []))
@@ -594,25 +600,21 @@ class BMSHandler(BaseHTTPRequestHandler):
             target_date = now - timedelta(days=i)
             day_str = target_date.strftime("%d.%m.")
             
-            # 1. Ertrag vom MPPT
             yield_val = get_mppt_daily_yield(i) or 0
             
-            # 2. Verbrauchsberechnung
             if i == 0:
-                # Heute: Live aus den Minutendaten berechnen
-                day_start_ts = int(target_date.replace(hour=0, minute=0, second=0).timestamp() * 1000)
-                samples = [p['y'] for p in cons_history if p['x'] >= day_start_ts]
-                day_cons_kwh = (sum(samples) / 60 / 1000) if samples else 0
-                # Wert für heute im Cache aktualisieren
+                with data_lock:
+                    history_cons = list(history_data.get("consumption", []))
+                    total_cons_wh = sum(p.get("y", 0) for p in history_cons) / 60.0
+                    day_cons_kwh = total_cons_wh / 1000.0
                 history_data["daily_cache"][day_str] = round(day_cons_kwh, 3)
             else:
-                # Vergangene Tage: Aus dem Cache laden
                 day_cons_kwh = history_data["daily_cache"].get(day_str, 0)
 
             data30.append({
                 "day": day_str, 
                 "yield": round(yield_val, 2),
-                "consumption": round(day_cons_kwh, 2)
+                "consumption": round(day_cons_kwh, 3)
             })
         
         self.send_response(200)
@@ -628,8 +630,8 @@ class BMSHandler(BaseHTTPRequestHandler):
             self.serve_json_data()
         elif self.path == '/history':
             self.serve_history()
-        elif self.path == '/history30':          # Neu
-            self.serve_history30()              # Neu
+        elif self.path == '/history30':
+            self.serve_history30()
         elif self.path.startswith('/tasmota/'):
             self.proxy_tasmota()
         elif self.path.startswith('/static/'):
@@ -644,7 +646,6 @@ class BMSHandler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
         with data_lock:
-            # Kopie der Listen erstellen, um Thread-Konflikte zu vermeiden
             safe_history = {k: list(v) for k, v in history_data.items()}
             history_json = json.dumps(safe_history, separators=(',', ':'))
         self.wfile.write(history_json.encode())
@@ -672,7 +673,6 @@ class BMSHandler(BaseHTTPRequestHandler):
             total_cons_wh = sum(p.get("y", 0) for p in history_cons) / 60.0
             daily_consumption = round(total_cons_wh / 1000.0, 3)
 
-        # Berechnung der Zell-Differenz und Status
         minc = d.get('min_cell', 0)
         maxc = d.get('max_cell', 0)
         delta = round(maxc - minc, 3) if minc and maxc else 0
@@ -685,7 +685,7 @@ class BMSHandler(BaseHTTPRequestHandler):
         house_power = round(max(0, current_pv - current_batt))
 
         monthly_yield = 0.0
-        monthly_consumption = 0.0 # Immer initialisieren
+        monthly_consumption = 0.0
         
         with data_lock:
             if "daily_cache" not in history_data:
@@ -736,7 +736,6 @@ class BMSHandler(BaseHTTPRequestHandler):
 
     def serve_html(self):
         """Generiert das HTML-Dashboard"""
-        # Initialwerte für den ersten Load
         soc_init = get_dbus_value('/Soc', 0)
         volt_init = get_dbus_value('/Dc/0/Voltage', 0)
         start_ts = int(server_start_time.timestamp() * 1000) if server_start_time else int(time.time() * 1000)
@@ -1353,7 +1352,6 @@ function updateData() {{
     }});
 }}
 
-// ── Tasmota Steuerung ──
 const tasmotaIps = {tasmota_ips_json};
 const tasmotaContainer = document.getElementById('tasmota-container');
 
@@ -1607,9 +1605,9 @@ def signal_handler(sig, frame):
 if __name__ == '__main__':
     signal.signal(signal.SIGINT,  signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    load_history()       # 1. Lädt bms_history_backup.json von der SD-Karte
-    ensure_cell_stats()  # 2. Verknüpft cell_daily_stats mit den geladenen Daten
-    cleanup_old_data()   # 3. Bereinigt alte Chart-Daten
+    load_history()
+    ensure_cell_stats()
+    cleanup_old_data()
     
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()
