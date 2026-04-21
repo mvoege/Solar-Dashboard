@@ -1,42 +1,52 @@
 import os
+import subprocess
 
 def update_config():
-    ntp_servers = "0.de.pool.ntp.org,1.de.pool.ntp.org,time.google.com"
+    ntp_servers = "ptbtime1.ptb.de,ptbtime2.ptb.de,0.de.pool.ntp.org"
     config_path = "/etc/connman/main.conf"
+    target_zone = "/usr/share/zoneinfo/Europe/Berlin"
     
-    # Zeitzone permanent auf Berlin setzen
-    if os.readlink("/etc/localtime") != "/usr/share/zoneinfo/Europe/Berlin":
-        os.system("ln -sf /usr/share/zoneinfo/Europe/Berlin /etc/localtime")
+    # 1. Zeitzone korrigieren
+    # Wir prüfen, ob der Link existiert und korrekt auf Berlin zeigt
+    try:
+        current_link = os.readlink("/etc/localtime") if os.path.islink("/etc/localtime") else ""
+        if current_link != target_zone:
+            os.system(f"ln -sf {target_zone} /etc/localtime")
+    except OSError:
+        os.system(f"ln -sf {target_zone} /etc/localtime")
 
-    # Prüfen, ob NTP-Server in der Config stehen
+    # 2. NTP Config in /etc/connman/main.conf prüfen/schreiben
     if os.path.exists(config_path):
         with open(config_path, "r") as f:
-            content = f.read()
+            lines = f.readlines()
         
-        if ntp_servers not in content:
-            # Hier nutzen wir einen f-String für die neue Zeile
-            new_line = f"FallbackTimeservers={ntp_servers}\n"
-            
-            # Simpler Austausch: Wir hängen es ans Ende von [General], 
-            # falls nicht vorhanden, oder überschreiben die Datei
-            lines = content.splitlines()
-            updated_lines = []
-            found_ntp = False
-            
-            for line in lines:
-                if line.startswith("FallbackTimeservers="):
-                    updated_lines.append(new_line.strip())
-                    found_ntp = True
+        updated = False
+        new_lines = []
+        
+        # Wir prüfen jede Zeile. Wenn die Fallback-Server nicht passen, ersetzen wir sie.
+        for line in lines:
+            if line.startswith("FallbackTimeservers="):
+                # Nur aktualisieren, wenn die gewünschten Server noch nicht drin stehen
+                if ntp_servers not in line:
+                    new_lines.append(f"FallbackTimeservers={ntp_servers}\n")
+                    updated = True
                 else:
-                    updated_lines.append(line)
-            
-            if not found_ntp:
-                updated_lines.append(new_line.strip())
-
+                    new_lines.append(line)
+            else:
+                new_lines.append(line)
+        
+        # Falls die Zeile "FallbackTimeservers" komplett fehlte (unwahrscheinlich, aber sicher ist sicher)
+        if not any(l.startswith("FallbackTimeservers=") for l in new_lines):
+            new_lines.append(f"FallbackTimeservers={ntp_servers}\n")
+            updated = True
+        
+        if updated:
             with open(config_path, "w") as f:
-                f.write("\n".join(updated_lines))
+                f.writelines(new_lines)
             
-            os.system("systemctl restart connman")
+            # 3. ConnMan neu starten (Der Weg, der bei dir funktioniert hat)
+            # Nutzt den absoluten Pfad für die Ausführung beim Booten
+            os.system("/etc/init.d/connman restart")
 
 if __name__ == "__main__":
     update_config()

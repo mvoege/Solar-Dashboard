@@ -13,6 +13,7 @@ import os
 import time
 import subprocess
 import threading
+from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from socketserver import ThreadingMixIn
@@ -52,14 +53,18 @@ HISTORY_BACKUP_FILE = "/data/apps/jk-bms/bms_history_backup.json"
 STATS_FILE = "/data/apps/jk-bms/bms_stats.json"
 
 server_start_time = None
+MAX_POINTS = 2000
+
 history_data = {
-    "mppt_pv_power":   [],
-    "mppt_pv_voltage": [],
-    "consumption":     [],
-    "charging":        []
+    "mppt_pv_power":   deque(maxlen=MAX_POINTS),
+    "mppt_pv_voltage": deque(maxlen=MAX_POINTS),
+    "consumption":     deque(maxlen=MAX_POINTS),
+    "charging":        deque(maxlen=MAX_POINTS)
 }
 bms_data = {}
 data_lock = threading.Lock()
+cell_daily_stats = {'min': [4.5] * CELL_COUNT, 'max': [0.0] * CELL_COUNT, 'last_reset_day': None}
+
 def ensure_cell_stats():
     global cell_daily_stats
     with data_lock:
@@ -121,10 +126,12 @@ if len(sys.argv) > 1:
             open(LOG_FILE, 'w').close()
         except:
             pass
-        subprocess.Popen(
-            f'"{sys.executable}" "{SCRIPT_PATH}" run_server >> "{LOG_FILE}" 2>&1 &',
-            shell=True
-        )
+        with open(LOG_FILE, "a") as logf:
+            subprocess.Popen(
+                [sys.executable, SCRIPT_PATH, "run_server"],
+                stdout=logf,
+                stderr=subprocess.STDOUT
+            )
         time.sleep(1.2)
         print(f"→ http://<IP>:{PORT}")
         print(f"Log: tail -f {LOG_FILE}")
@@ -288,42 +295,66 @@ def dbus_poller():
             continue
 
         try:
+            # Vorbereitung der temporären Daten
             temp = {
-                'cells': [],
                 'pv_voltage': 0.0,
                 'pv_power': 0.0,
+                'cells': []
             }
 
+            # MPPT Daten sammeln
             for svc in mppt_services:
                 try:
                     v = get_dbus_value('/Pv/V', 0, svc) or get_dbus_value('/Pv/0/V', 0, svc)
                     p = get_dbus_value('/Yield/Power', 0, svc) or get_dbus_value('/Pv/0/P', 0, svc)
-                    temp['pv_voltage'] += float(v or 0)
-                    temp['pv_power'] += float(p or 0)
-                except:
+                    temp['pv_voltage'] += float(v if v is not None else 0)
+                    temp['pv_power'] += float(p if p is not None else 0)
+                except Exception:
                     continue
 
-            temp['power']   = get_dbus_value('/Dc/0/Power')
-            temp['current'] = get_dbus_value('/Dc/0/Current')
+            # Standard-Batteriewerte
+            temp['power']       = get_dbus_value('/Dc/0/Power')
+            temp['current']     = get_dbus_value('/Dc/0/Current')
             temp['soc']         = get_dbus_value('/Soc')
             temp['voltage']     = get_dbus_value('/Dc/0/Voltage')
             temp['temperature'] = get_dbus_value('/Dc/0/Temperature')
             temp['min_cell']    = get_dbus_value('/System/MinCellVoltage')
             temp['max_cell']    = get_dbus_value('/System/MaxCellVoltage')
 
-            for i in range(1, CELL_COUNT + 1):
-                v = get_dbus_value(f'/Voltages/Cell{i}')
-                if v is not None and isinstance(v, (int, float)) and v > 0.5:
-                    temp['cells'].append(round(float(v), 3))
+            # Zellspannungen verarbeiten (Zyklus-Logik)
+            if not hasattr(dbus_poller, "cycle_count"): 
+                dbus_poller.cycle_count = 0
+            
+            dbus_poller.cycle_count += 1
 
+            # Nur alle 3 Durchgänge die Einzelzellen vom D-Bus abfragen (CPU-Last senken)
+            if dbus_poller.cycle_count % 3 == 0:
+                new_cells = []
+                for i in range(1, CELL_COUNT + 1):
+                    v = get_dbus_value(f'/Voltages/Cell{i}')
+                    if v is not None and isinstance(v, (int, float)) and v > 0.5:
+                        new_cells.append(round(float(v), 3))
+                
+                # Nur übernehmen, wenn wir einen vollständigen Satz Zellen erhalten haben
+                if len(new_cells) == CELL_COUNT:
+                    temp['cells'] = new_cells
+                else:
+                    # Fallback auf alte Werte, falls D-Bus unvollständig antwortet
+                    with data_lock:
+                        temp['cells'] = bms_data.get('cells', [])
+            else:
+                # In den Zwischenzyklen immer die alten Werte behalten
+                with data_lock:
+                    temp['cells'] = bms_data.get('cells', [])
+
+            # Daten global schreiben
             with data_lock:
                 bms_data.update(temp)
-                bms_data["dbus_ok"] = dbus_available
+                bms_data["dbus_ok"] = True # Da wir im try-Block erfolgreich waren
                 global last_update
                 last_update = int(time.time() * 1000)
 
             error_streak = 0
-            # Verkürzt auf 0.7 Sekunden für schnellere Synchronisation
             time.sleep(0.7)
 
         except Exception as e:
@@ -335,6 +366,9 @@ def dbus_poller():
                     _dbus_item_cache.clear()
                 discover_dbus_services()
                 error_streak = 0
+            
+            with data_lock:
+                bms_data["dbus_ok"] = False
             time.sleep(2.0)
 
 def load_history():
@@ -350,6 +384,7 @@ def load_history():
                 log_message(f"Lade Backup aus /data (Alter: {int(age)}s)")
             else:
                 log_message(f"Backup in /data zu alt ({int(age)}s), wird ignoriert.")
+                source = None
         else:
             source = None
 
@@ -357,10 +392,17 @@ def load_history():
         try:
             with open(source, "r") as f:
                 loaded = json.load(f)
-                if isinstance(loaded, dict) and "mppt_pv_power" in loaded:
-                    with data_lock:
-                        history_data = loaded
-                    log_message(f"History erfolgreich aus {source} geladen.")
+
+            if isinstance(loaded, dict) and "mppt_pv_power" in loaded:
+                with data_lock:
+                    history_data = loaded
+
+                    for key in ["mppt_pv_power", "mppt_pv_voltage", "consumption", "charging"]:
+                        if key in history_data:
+                            history_data[key] = deque(history_data[key], maxlen=MAX_POINTS)
+
+            log_message(f"History erfolgreich aus {source} geladen.")
+
         except Exception as e:
             log_message(f"History Laden Fehler: {e}", "ERROR")
 
@@ -368,9 +410,12 @@ def load_history():
         try:
             with open(STATS_FILE, "r") as f:
                 stats = json.load(f)
-                with data_lock:
-                    history_data["daily_cache"] = stats
-                log_message("Langzeit-Statistiken (daily_cache) geladen.")
+
+            with data_lock:
+                history_data["daily_cache"] = stats
+
+            log_message("Langzeit-Statistiken (daily_cache) geladen.")
+
         except Exception as e:
             log_message(f"Fehler beim Laden der Stats: {e}")
 
@@ -381,9 +426,15 @@ def save_history(backup=False):
     """
     try:
         with data_lock:
-            if not any(history_data.values()): return
+            if not any(history_data.values()):
+                return
+
+            chart_data = {
+                k: list(v) if isinstance(v, deque) else v
+                for k, v in history_data.items()
+                if k != "daily_cache"
+            }
             
-            chart_data = {k: v for k, v in history_data.items() if k != "daily_cache"}
             stats_data = history_data.get("daily_cache", {})
 
         for path in ([HISTORY_FILE, HISTORY_BACKUP_FILE] if backup else [HISTORY_FILE]):
@@ -451,6 +502,8 @@ def history_autosaver():
         time.sleep(HISTORY_AUTOSAVE_INTERVAL)
         save_history()
 
+LOOP_INTERVAL = 5  # echtes 5s Intervall
+
 def collect_data():
     log_message("History-Sammler gestartet (5s Intervall mit Mittelwertbildung)")
     global cell_daily_stats
@@ -458,14 +511,16 @@ def collect_data():
     last_save_time = time.time()
 
     while True:
+        loop_start = time.time()
+
         try:
             now_dt = datetime.now()
             reset_id = now_dt.strftime("%Y-%m-%d") if now_dt.hour >= HISTORY_WINDOW_START_HOUR else (now_dt - timedelta(days=1)).strftime("%Y-%m-%d")
             
             if cell_daily_stats.get('last_reset_day') != reset_id:
                 with data_lock:
-                    history_data["cell_stats"]['min'] = [4.5] * 24
-                    history_data["cell_stats"]['max'] = [0.0] * 24
+                    history_data["cell_stats"]['min'] = [4.5] * CELL_COUNT
+                    history_data["cell_stats"]['max'] = [0.0] * CELL_COUNT
                     history_data["cell_stats"]['last_reset_day'] = reset_id
                     cell_daily_stats = history_data["cell_stats"]
                 log_message(f"Zell-Tagesstatistik zurückgesetzt für {reset_id}")
@@ -474,23 +529,26 @@ def collect_data():
                 time.sleep(30)
                 continue
 
+            # 🔥 LOCK NUR FÜR SNAPSHOT
             with data_lock:
-                if time.time() - (last_update / 1000) > 10:
-                    time.sleep(5)
-                    continue
-                
-                current_cells = bms_data.get('cells', [])
-                for i, v in enumerate(current_cells):
-                    if v > 2.0 and i < len(cell_daily_stats['min']):
-                        if v < cell_daily_stats['min'][i]:
-                            cell_daily_stats['min'][i] = v
-                        if v > cell_daily_stats['max'][i]:
-                            cell_daily_stats['max'][i] = v
-                
+                last_update_local = last_update
+                current_cells = list(bms_data.get('cells', []))
                 v = bms_data.get('voltage', 0)
                 p_pv = bms_data.get('pv_power', 0)
                 v_pv = bms_data.get('pv_voltage', 0)
                 p_batt = bms_data.get('power', 0)
+
+            # 🔓 ab hier ohne Lock arbeiten
+            if time.time() - (last_update_local / 1000) > 10:
+                time.sleep(5)
+                continue
+
+            for i, val in enumerate(current_cells):
+                if val > 2.0 and i < len(cell_daily_stats['min']):
+                    if val < cell_daily_stats['min'][i]:
+                        cell_daily_stats['min'][i] = val
+                    if val > cell_daily_stats['max'][i]:
+                        cell_daily_stats['max'][i] = val
 
             if v <= 0.1:
                 time.sleep(10)
@@ -507,44 +565,29 @@ def collect_data():
                 if samples:
                     avg = {k: sum(s[k] for s in samples) / len(samples) for k in ['p_pv', 'v_pv', 'p_batt']}
                     now_ms = int(now * 1000)
-                    
+
                     with data_lock:
                         p_pv = avg['p_pv']
                         p_batt = avg['p_batt']
-                        actual_cons = max(0, p_pv - p_batt) 
+                        actual_cons = max(0, p_pv - p_batt)
 
                         history_data["mppt_pv_power"].append({"x": now_ms, "y": round(p_pv)})
                         history_data["mppt_pv_voltage"].append({"x": now_ms, "y": round(avg['v_pv'], 1)})
                         history_data["consumption"].append({"x": now_ms, "y": round(actual_cons)})
                         history_data["charging"].append({"x": now_ms, "y": round(max(0, p_batt))})
 
-                if USE_VICTRON_DAILY_YIELD and mppt_services:
-                    vy_today = get_mppt_daily_yield(0)
-                    vy_yesterday = get_mppt_daily_yield(1)
-                    
-                    now_hour = datetime.now().hour
-                    if (
-                        vy_today is not None
-                        and vy_yesterday is not None
-                        and now_hour < HISTORY_WINDOW_START_HOUR
-                        and abs(vy_today - vy_yesterday) < 0.001
-                    ):
-                        vy_today = 0.0
-
-                    with data_lock:
-                        if vy_today is not None:
-                            bms_data['daily_pv_yield'] = round(vy_today, 3)
-                        if vy_yesterday is not None:
-                            bms_data['yield_yesterday'] = round(vy_yesterday, 3)
-
                 cleanup_old_data()
-                samples = []
+                samples.clear()
                 last_save_time = now
 
         except Exception as e:
             log_message(f"collect_data Fehler: {e}", "ERROR")
-            samples = []
+            samples.clear()
             time.sleep(10)
+
+        # 🔥 DRIFT-FREIER LOOP
+        elapsed = time.time() - loop_start
+        time.sleep(max(0, LOOP_INTERVAL - elapsed))
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
@@ -556,35 +599,40 @@ class BMSHandler(BaseHTTPRequestHandler):
         return
 
     def proxy_tasmota(self):
-        """Proxy für Tasmota-Geräte mit Timeout-Schutz und IP-Whitelist."""
         try:
             path_parts = self.path.split('/')
-            if len(path_parts) < 3: return
+            if len(path_parts) < 3:
+                return
             
-            ip = path_parts[2].split('?')[0]
-            query = self.path.split('cmd=')[1] if 'cmd=' in self.path else 'Power'
+            # Extrahiere IP und entferne Query-Parameter
+            target = path_parts[2].split('?')[0]
             
-            if ip not in TASMOTA_IPS:
-                log_message(f"Unautorisierter Tasmota-Zugriff auf IP: {ip}", "WARNING")
+            if target not in TASMOTA_IPS:
+                log_message(f"Unautorisierter Tasmota-Zugriff: {target}", "WARNING")
                 self.send_error(403, "IP not authorized")
                 return
 
-            url = f"http://{ip}/cm?cmnd={query}"
+            # Befehl sicher extrahieren
+            query = "Power"
+            if 'cmd=' in self.path:
+                query = self.path.split('cmd=')[1]
+
+            url = f"http://{target}/cm?cmnd={query}"
             
-            with urllib.request.urlopen(url, timeout=2.0) as response:
-                res_data = response.read()
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=2.5) as response:
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(res_data)
+                self.wfile.write(response.read())
                 
-        except (urllib.error.URLError, TimeoutError, Exception) as e:
+        except Exception as e:
+            log_message(f"Tasmota Proxy Fehler: {e}", "DEBUG")
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            fallback = {"POWER": "OFF", "State": "Offline", "Error": str(e)}
-            self.wfile.write(json.dumps(fallback).encode())
+            self.wfile.write(json.dumps({"POWER": "OFF", "State": "Offline"}).encode())
 
     def serve_history30(self):
         """Liest Ertrag vom MPPT und Verbrauch aus dem Cache/Minutendaten"""
@@ -592,8 +640,7 @@ class BMSHandler(BaseHTTPRequestHandler):
         now = datetime.now()
         
         with data_lock:
-            if "daily_cache" not in history_data:
-                history_data["daily_cache"] = {}
+            daily_cache = history_data.setdefault("daily_cache", {})
             cons_history = list(history_data.get("consumption", []))
 
         for i in range(29, -1, -1):
@@ -653,7 +700,11 @@ class BMSHandler(BaseHTTPRequestHandler):
     def serve_static(self):
         """Serviert statische Dateien wie chart.js"""
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(base_dir, self.path.lstrip('/'))
+        safe_path = os.path.normpath(self.path).lstrip('/')
+        path = os.path.join(base_dir, safe_path)
+        if not path.startswith(base_dir):
+            self.send_error(403)
+            return
         if not os.path.isfile(path):
             self.send_error(404)
             return
@@ -705,6 +756,7 @@ class BMSHandler(BaseHTTPRequestHandler):
                     monthly_consumption += daily_cache.get(day_str, 0)
 
         data = {
+            "timestamp": last_update,
             "soc": d.get('soc', 0),
             "voltage": d.get('voltage', 0),
             "dbus_ok": d.get("dbus_ok", False),
@@ -869,7 +921,7 @@ class BMSHandler(BaseHTTPRequestHandler):
         </div>
     </div>
 
-    <div class="footer">Solar Dashboard {VERSION} – Datum:<span id="current-date">00.00.0000</span> – Läuft seit: <span id="uptime">00:00:00</span> Stunden</div>
+    <div class="footer">Solar Dashboard {VERSION} – Datum: <span id="current-date">00.00.0000</span> – Läuft seit: <span id="uptime">00:00:00</span> Stunden</div>
 </div>
 
 <script>
@@ -1047,26 +1099,18 @@ function initMpptChart() {{
                 easing: 'easeOutQuart'
             }},
             maintainAspectRatio: false,
+            // Das sorgt dafür, dass die Linie reagiert, wenn man nah dran ist
             interaction: {{
-                mode: 'index',
-                intersect: false
+                mode: 'nearest',
+                intersect: true,
+                axis: 'xy'
             }},
             plugins: {{
                 legend: {{ position: 'top' }},
                 tooltip: {{
                     enabled: true,
                     position: 'nearest',
-                    external: function(context) {{
-                        const tooltipModel = context.tooltip;
-                        if (tooltipModel.opacity !== 0) {{
-                            if (window.mpptTimer) clearTimeout(window.mpptTimer);
-                            window.mpptTimer = setTimeout(() => {{
-                                tooltipModel.opacity = 0;
-                                context.chart.setActiveElements([]);
-                                context.chart.update();
-                            }}, 10000); // 10000ms = 10 Sekunden
-                        }}
-                    }},
+                    // Entferne hier den 'external' Block, falls er noch da ist
                     callbacks: {{
                         label: function(context) {{
                             let label = context.dataset.label || '';
@@ -1080,6 +1124,17 @@ function initMpptChart() {{
                             return label + ': ' + val.toFixed(2) + unit;
                         }}
                     }}
+                }}
+            }},
+            // Diese Sektion ist neu/wichtig für das Treffen der Linie:
+            elements: {{
+                point: {{
+                    radius: 0.1,      // Sichtbarer Punkt bleibt klein
+                    hitRadius: 20,    // Klick-Bereich wird größer (10px um den Punkt/Linie)
+                    hoverRadius: 5    // Punkt wird beim Drüberfahren leicht größer
+                }},
+                line: {{
+                    borderWidth: 1
                 }}
             }},
             scales: {{
@@ -1322,19 +1377,20 @@ function updateData() {{
             if (warnCellEl.innerHTML !== ico) warnCellEl.innerHTML = ico;
         }});
 
-        const now = Date.now();
+        const serverTs = data.timestamp; 
         const lastDs = mpptChart.data.datasets[0].data;
         const lastTs = lastDs.length > 0 ? lastDs[lastDs.length - 1].x : 0;
 
-        if (now - lastTs > 60000 || lastDs.length === 0) {{
+        // Im f-String müssen Klammern verdoppelt werden: {{ }}
+        if (serverTs > lastTs) {{
             const pwr_pv = data.pv_power || 0;
             const pwr_batt = data.battery_power || 0;
             const pwr_cons = Math.max(0, pwr_pv - pwr_batt); 
 
-            mpptChart.data.datasets[0].data.push({{ x: now, y: pwr_pv }});
-            mpptChart.data.datasets[1].data.push({{ x: now, y: data.pv_voltage || 0 }});
-            mpptChart.data.datasets[2].data.push({{ x: now, y: pwr_cons }});
-            mpptChart.data.datasets[3].data.push({{ x: now, y: pwr_batt }});
+            mpptChart.data.datasets[0].data.push({{ x: serverTs, y: pwr_pv }});
+            mpptChart.data.datasets[1].data.push({{ x: serverTs, y: data.pv_voltage || 0 }});
+            mpptChart.data.datasets[2].data.push({{ x: serverTs, y: pwr_cons }});
+            mpptChart.data.datasets[3].data.push({{ x: serverTs, y: pwr_batt }});
 
             if (mpptChart.data.datasets[0].data.length > MAX_CHART_POINTS) {{
                 mpptChart.data.datasets.forEach(ds => ds.data.shift());
@@ -1343,6 +1399,7 @@ function updateData() {{
             cleanupChartData();
             mpptChart.update('none');
         }}
+        
         setTimeout(updateData, 2000);
     }})
     .catch(() => {{
