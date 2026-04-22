@@ -181,7 +181,6 @@ if len(sys.argv) > 1:
 if len(sys.argv) == 1:
     os.execv(sys.executable, [sys.executable, SCRIPT_PATH, "start"])
 
-# D-Bus Setup
 sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusItemImport
 
@@ -295,14 +294,12 @@ def dbus_poller():
             continue
 
         try:
-            # Vorbereitung der temporären Daten
             temp = {
                 'pv_voltage': 0.0,
                 'pv_power': 0.0,
                 'cells': []
             }
 
-            # MPPT Daten sammeln
             for svc in mppt_services:
                 try:
                     v = get_dbus_value('/Pv/V', 0, svc) or get_dbus_value('/Pv/0/V', 0, svc)
@@ -312,7 +309,6 @@ def dbus_poller():
                 except Exception:
                     continue
 
-            # Standard-Batteriewerte
             temp['power']       = get_dbus_value('/Dc/0/Power')
             temp['current']     = get_dbus_value('/Dc/0/Current')
             temp['soc']         = get_dbus_value('/Soc')
@@ -321,36 +317,30 @@ def dbus_poller():
             temp['min_cell']    = get_dbus_value('/System/MinCellVoltage')
             temp['max_cell']    = get_dbus_value('/System/MaxCellVoltage')
 
-            # Zellspannungen verarbeiten (Zyklus-Logik)
             if not hasattr(dbus_poller, "cycle_count"): 
                 dbus_poller.cycle_count = 0
             
             dbus_poller.cycle_count += 1
 
-            # Nur alle 3 Durchgänge die Einzelzellen vom D-Bus abfragen (CPU-Last senken)
             if dbus_poller.cycle_count % 3 == 0:
                 new_cells = []
                 for i in range(1, CELL_COUNT + 1):
                     v = get_dbus_value(f'/Voltages/Cell{i}')
                     if v is not None and isinstance(v, (int, float)) and v > 0.5:
                         new_cells.append(round(float(v), 3))
-                
-                # Nur übernehmen, wenn wir einen vollständigen Satz Zellen erhalten haben
+
                 if len(new_cells) == CELL_COUNT:
                     temp['cells'] = new_cells
                 else:
-                    # Fallback auf alte Werte, falls D-Bus unvollständig antwortet
                     with data_lock:
                         temp['cells'] = bms_data.get('cells', [])
             else:
-                # In den Zwischenzyklen immer die alten Werte behalten
                 with data_lock:
                     temp['cells'] = bms_data.get('cells', [])
 
-            # Daten global schreiben
             with data_lock:
                 bms_data.update(temp)
-                bms_data["dbus_ok"] = True # Da wir im try-Block erfolgreich waren
+                bms_data["dbus_ok"] = True
                 global last_update
                 last_update = int(time.time() * 1000)
 
@@ -429,6 +419,7 @@ def save_history(backup=False):
             if not any(history_data.values()):
                 return
 
+            # Trenne die Daten für die unterschiedlichen Dateien
             chart_data = {
                 k: list(v) if isinstance(v, deque) else v
                 for k, v in history_data.items()
@@ -437,14 +428,20 @@ def save_history(backup=False):
             
             stats_data = history_data.get("daily_cache", {})
 
-        for path in ([HISTORY_FILE, HISTORY_BACKUP_FILE] if backup else [HISTORY_FILE]):
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+        paths_to_save = [HISTORY_FILE]
+        if backup:
+            paths_to_save.append(HISTORY_BACKUP_FILE)
+
+        for path in paths_to_save:
+            if os.path.dirname(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = path + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(chart_data, f, separators=(',', ':'))
             os.replace(tmp, path)
 
-        os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
+        if os.path.dirname(STATS_FILE):
+            os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
         tmp_s = STATS_FILE + ".tmp"
         with open(tmp_s, "w") as f:
             json.dump(stats_data, f, indent=4, ensure_ascii=False)
@@ -502,7 +499,7 @@ def history_autosaver():
         time.sleep(HISTORY_AUTOSAVE_INTERVAL)
         save_history()
 
-LOOP_INTERVAL = 5  # echtes 5s Intervall
+LOOP_INTERVAL = 5
 
 def collect_data():
     log_message("History-Sammler gestartet (5s Intervall mit Mittelwertbildung)")
@@ -529,7 +526,6 @@ def collect_data():
                 time.sleep(30)
                 continue
 
-            # 🔥 LOCK NUR FÜR SNAPSHOT
             with data_lock:
                 last_update_local = last_update
                 current_cells = list(bms_data.get('cells', []))
@@ -538,7 +534,6 @@ def collect_data():
                 v_pv = bms_data.get('pv_voltage', 0)
                 p_batt = bms_data.get('power', 0)
 
-            # 🔓 ab hier ohne Lock arbeiten
             if time.time() - (last_update_local / 1000) > 10:
                 time.sleep(5)
                 continue
@@ -585,7 +580,6 @@ def collect_data():
             samples.clear()
             time.sleep(10)
 
-        # 🔥 DRIFT-FREIER LOOP
         elapsed = time.time() - loop_start
         time.sleep(max(0, LOOP_INTERVAL - elapsed))
 
@@ -603,8 +597,7 @@ class BMSHandler(BaseHTTPRequestHandler):
             path_parts = self.path.split('/')
             if len(path_parts) < 3:
                 return
-            
-            # Extrahiere IP und entferne Query-Parameter
+
             target = path_parts[2].split('?')[0]
             
             if target not in TASMOTA_IPS:
@@ -612,7 +605,6 @@ class BMSHandler(BaseHTTPRequestHandler):
                 self.send_error(403, "IP not authorized")
                 return
 
-            # Befehl sicher extrahieren
             query = "Power"
             if 'cmd=' in self.path:
                 query = self.path.split('cmd=')[1]
@@ -635,13 +627,21 @@ class BMSHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"POWER": "OFF", "State": "Offline"}).encode())
 
     def serve_history30(self):
-        """Liest Ertrag vom MPPT und Verbrauch aus dem Cache/Minutendaten"""
+        """Liest Ertrag vom MPPT und Verbrauch (max 30 Tage)"""
         data30 = []
         now = datetime.now()
+
+        allowed_days = [(now - timedelta(days=i)).strftime("%d.%m.") for i in range(32)]
         
         with data_lock:
-            daily_cache = history_data.setdefault("daily_cache", {})
-            cons_history = list(history_data.get("consumption", []))
+            if "daily_cache" not in history_data:
+                history_data["daily_cache"] = {}
+            
+            daily_cache = history_data["daily_cache"]
+
+            keys_to_delete = [k for k in daily_cache.keys() if k not in allowed_days]
+            for k in keys_to_delete:
+                del daily_cache[k]
 
         for i in range(29, -1, -1):
             target_date = now - timedelta(days=i)
@@ -653,15 +653,15 @@ class BMSHandler(BaseHTTPRequestHandler):
                 with data_lock:
                     history_cons = list(history_data.get("consumption", []))
                     total_cons_wh = sum(p.get("y", 0) for p in history_cons) / 60.0
-                    day_cons_kwh = total_cons_wh / 1000.0
-                history_data["daily_cache"][day_str] = round(day_cons_kwh, 3)
+                    day_cons_kwh = round(total_cons_wh / 1000.0, 3)
+                    daily_cache[day_str] = day_cons_kwh
             else:
-                day_cons_kwh = history_data["daily_cache"].get(day_str, 0)
+                day_cons_kwh = daily_cache.get(day_str, 0)
 
             data30.append({
                 "day": day_str, 
                 "yield": round(yield_val, 2),
-                "consumption": round(day_cons_kwh, 3)
+                "consumption": day_cons_kwh
             })
         
         self.send_response(200)
@@ -719,8 +719,10 @@ class BMSHandler(BaseHTTPRequestHandler):
         """Bereitet aktuelle BMS-Daten für das Frontend auf"""
         with data_lock:
             d = bms_data.copy()
-
-            history_cons = history_data.get("consumption", [])
+            
+            cutoff_ms, _ = get_history_window()
+            
+            history_cons = [p for p in history_data.get("consumption", []) if p.get("x", 0) >= cutoff_ms]
             total_cons_wh = sum(p.get("y", 0) for p in history_cons) / 60.0
             daily_consumption = round(total_cons_wh / 1000.0, 3)
 
