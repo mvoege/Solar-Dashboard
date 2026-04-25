@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# JK-BMS Dashboard – Version 1.0.2 © by M.Vöge
+# Solar Dashboard – by M.Vöge (mit Chart-Optimierungen)
 # for Venus OS Large 3.7x Raspberry Pi
 # D-Bus-Treiber wird benötigt von https://github.com/mr-manuel/venus-os_dbus-serialbattery
 
@@ -13,7 +13,6 @@ import os
 import time
 import subprocess
 import threading
-from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from socketserver import ThreadingMixIn
@@ -30,6 +29,7 @@ BALANCING_START_DELTA = 0.005                           # Ab dieser Delta gilt B
 BALANCING_START_VOLTAGE = 3.40                          # Ab dieser Wert wird Balancing als aktiv
 LOW_VOLTAGE_WARNING = 24.00                             # Warnung ab dieser Spannung (0.0 = deaktivieren)
 LOW_SOC_WARNING = 25                                    # Warnung ab diesem SOC in % (0 = deaktivieren)
+MIN_CHARGE_CURRENT_FOR_PULSE = 1.0                      # Ladestrom muss mind. X A sein für Puls (Absorption)
 PORT = 99                                               # Webserver-Port (Standard: 99)
 HISTORY_WINDOW_START_HOUR = 0                           # Uhrzeit wann live Werte zurückgesetzt werden soll
 TASMOTA_IPS = ["192.168.0.14", "192.168.0.17"]          # Tasmota Geräte – IPs hier eintragen
@@ -40,40 +40,48 @@ primary_battery_service = None
 
 USE_VICTRON_DAILY_YIELD = True
 HISTORY_WINDOW_24H_MS = 24 * 60 * 60 * 1000
-HISTORY_AUTOSAVE_INTERVAL = 300
+HISTORY_AUTOSAVE_INTERVAL = 5
 
 DEBUG = False # False / True
 
-VERSION = "1.0.2"
+VERSION = "1.0.21"
 SCRIPT_PATH = os.path.abspath(__file__)
 SCRIPT_NAME = os.path.basename(__file__)
 LOG_FILE = "/var/volatile/tmp/jk_bms_dashboard.log"
 HISTORY_FILE = "/var/volatile/tmp/bms_history.json"
 HISTORY_BACKUP_FILE = "/data/apps/jk-bms/bms_history_backup.json"
-STATS_FILE = "/data/apps/jk-bms/bms_stats.json"
+CONSUMPTION_FILE = "/var/volatile/tmp/consumption_history.json"
+CONSUMPTION_BACKUP_FILE = "/data/apps/jk-bms/consumption_backup.json"
 
 server_start_time = None
-MAX_POINTS = 2000
-
 history_data = {
-    "mppt_pv_power":   deque(maxlen=MAX_POINTS),
-    "mppt_pv_voltage": deque(maxlen=MAX_POINTS),
-    "consumption":     deque(maxlen=MAX_POINTS),
-    "charging":        deque(maxlen=MAX_POINTS)
+    "mppt_pv_power":   [],
+    "mppt_pv_voltage": [],
+    "consumption":     [],
+    "charging":        [],
+    "cell_stats": {
+        'min': [4.5] * CELL_COUNT,
+        'max': [0.0] * CELL_COUNT,
+        'last_reset_day': None
+    }
 }
 bms_data = {}
 data_lock = threading.Lock()
-cell_daily_stats = {'min': [4.5] * CELL_COUNT, 'max': [0.0] * CELL_COUNT, 'last_reset_day': None}
+cell_daily_stats = history_data["cell_stats"]
 
 def ensure_cell_stats():
     global cell_daily_stats
     with data_lock:
-        if "cell_stats" not in history_data:
+        if "cell_stats" not in history_data or not isinstance(history_data["cell_stats"], dict):
             history_data["cell_stats"] = {
                 'min': [4.5] * CELL_COUNT,
                 'max': [0.0] * CELL_COUNT,
                 'last_reset_day': None
             }
+        if len(history_data["cell_stats"]['min']) != CELL_COUNT:
+            history_data["cell_stats"]['min'] = [4.5] * CELL_COUNT
+            history_data["cell_stats"]['max'] = [0.0] * CELL_COUNT
+            
         cell_daily_stats = history_data["cell_stats"]
 last_update = 0
 
@@ -126,12 +134,10 @@ if len(sys.argv) > 1:
             open(LOG_FILE, 'w').close()
         except:
             pass
-        with open(LOG_FILE, "a") as logf:
-            subprocess.Popen(
-                [sys.executable, SCRIPT_PATH, "run_server"],
-                stdout=logf,
-                stderr=subprocess.STDOUT
-            )
+        subprocess.Popen(
+            f'"{sys.executable}" "{SCRIPT_PATH}" run_server >> "{LOG_FILE}" 2>&1 &',
+            shell=True
+        )
         time.sleep(1.2)
         print(f"→ http://<IP>:{PORT}")
         print(f"Log: tail -f {LOG_FILE}")
@@ -181,6 +187,7 @@ if len(sys.argv) > 1:
 if len(sys.argv) == 1:
     os.execv(sys.executable, [sys.executable, SCRIPT_PATH, "start"])
 
+# D-Bus Setup
 sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusItemImport
 
@@ -208,14 +215,14 @@ def get_dbus_value(path, default=0, service=None):
 
     try:
         if key not in _dbus_item_cache:
-            log_message(f"Initialisiere D-Bus Pfad: {path} auf {current_service}")
+            # Nur loggen wenn wirklich neu, sonst wird das Log geflutet
             _dbus_item_cache[key] = VeDbusItemImport(bus, current_service, path)
         
         item = _dbus_item_cache[key]
         val = item.get_value()
         
         if val is None:
-            val = default
+            return default
 
         with _dbus_cache_lock:
             _dbus_cache[key] = (now, val)
@@ -223,10 +230,11 @@ def get_dbus_value(path, default=0, service=None):
         dbus_available = True
         return val
 
-    except Exception as e:
-        if key in _dbus_item_cache:
-            del _dbus_item_cache[key]
+    except:
         dbus_available = False
+        with _dbus_cache_lock:
+            if key in _dbus_cache:
+                return _dbus_cache[key][1]
         return default
 
 def discover_dbus_services():
@@ -246,7 +254,7 @@ def discover_dbus_services():
             if val is not None:
                 with data_lock:
                     bms_data['daily_pv_yield'] = round(float(val), 3)
-                log_message(f"Initialer Tagesertrag von {mppt} geladen: {val} kWh")
+                log_message(f"Initialer Tagesertrag von {mppt} geladen: {val} kwh")
             
             val_yesterday = get_dbus_value_immediate(mppt, '/History/Daily/1/Yield')
             if val_yesterday is not None:
@@ -295,57 +303,40 @@ def dbus_poller():
 
         try:
             temp = {
-                'pv_voltage': 0.0,
-                'pv_power': 0.0,
-                'cells': []
+                'soc':         get_dbus_value('/Soc'),
+                'voltage':     get_dbus_value('/Dc/0/Voltage'),
+                'current':     get_dbus_value('/Dc/0/Current'),
+                'power':       get_dbus_value('/Dc/0/Power'),
+                'temperature': get_dbus_value('/Dc/0/Temperature'),
+                'min_cell':    get_dbus_value('/System/MinCellVoltage'),
+                'max_cell':    get_dbus_value('/System/MaxCellVoltage'),
+                'cells':       [],
+                'pv_voltage':  0.0,
+                'pv_power':    0.0,
             }
+
+            for i in range(1, CELL_COUNT + 1):
+                v = get_dbus_value(f'/Voltages/Cell{i}')
+                if v is not None and isinstance(v, (int, float)) and v > 0.5:
+                    temp['cells'].append(round(float(v), 3))
 
             for svc in mppt_services:
                 try:
                     v = get_dbus_value('/Pv/V', 0, svc) or get_dbus_value('/Pv/0/V', 0, svc)
                     p = get_dbus_value('/Yield/Power', 0, svc) or get_dbus_value('/Pv/0/P', 0, svc)
-                    temp['pv_voltage'] += float(v if v is not None else 0)
-                    temp['pv_power'] += float(p if p is not None else 0)
-                except Exception:
+                    temp['pv_voltage'] += float(v or 0)
+                    temp['pv_power'] += float(p or 0)
+                except:
                     continue
-
-            temp['power']       = get_dbus_value('/Dc/0/Power')
-            temp['current']     = get_dbus_value('/Dc/0/Current')
-            temp['soc']         = get_dbus_value('/Soc')
-            temp['voltage']     = get_dbus_value('/Dc/0/Voltage')
-            temp['temperature'] = get_dbus_value('/Dc/0/Temperature')
-            temp['min_cell']    = get_dbus_value('/System/MinCellVoltage')
-            temp['max_cell']    = get_dbus_value('/System/MaxCellVoltage')
-
-            if not hasattr(dbus_poller, "cycle_count"): 
-                dbus_poller.cycle_count = 0
-            
-            dbus_poller.cycle_count += 1
-
-            if dbus_poller.cycle_count % 3 == 0:
-                new_cells = []
-                for i in range(1, CELL_COUNT + 1):
-                    v = get_dbus_value(f'/Voltages/Cell{i}')
-                    if v is not None and isinstance(v, (int, float)) and v > 0.5:
-                        new_cells.append(round(float(v), 3))
-
-                if len(new_cells) == CELL_COUNT:
-                    temp['cells'] = new_cells
-                else:
-                    with data_lock:
-                        temp['cells'] = bms_data.get('cells', [])
-            else:
-                with data_lock:
-                    temp['cells'] = bms_data.get('cells', [])
 
             with data_lock:
                 bms_data.update(temp)
-                bms_data["dbus_ok"] = True
+                bms_data["dbus_ok"] = dbus_available
                 global last_update
                 last_update = int(time.time() * 1000)
 
             error_streak = 0
-            time.sleep(0.7)
+            time.sleep(1.3)
 
         except Exception as e:
             error_streak += 1
@@ -356,99 +347,92 @@ def dbus_poller():
                     _dbus_item_cache.clear()
                 discover_dbus_services()
                 error_streak = 0
-            
-            with data_lock:
-                bms_data["dbus_ok"] = False
             time.sleep(2.0)
 
 def load_history():
     global history_data
-    source = HISTORY_FILE
-
-    if not os.path.exists(source):
-        if os.path.exists(HISTORY_BACKUP_FILE):
-            mtime = os.path.getmtime(HISTORY_BACKUP_FILE)
-            age = time.time() - mtime
-            if age < 600:
-                source = HISTORY_BACKUP_FILE
-                log_message(f"Lade Backup aus /data (Alter: {int(age)}s)")
-            else:
-                log_message(f"Backup in /data zu alt ({int(age)}s), wird ignoriert.")
-                source = None
-        else:
-            source = None
-
-    if source:
+    if os.path.exists(HISTORY_BACKUP_FILE):
         try:
-            with open(source, "r") as f:
-                loaded = json.load(f)
-
-            if isinstance(loaded, dict) and "mppt_pv_power" in loaded:
+            with open(HISTORY_BACKUP_FILE, "r") as f:
+                data = json.load(f)
                 with data_lock:
-                    history_data = loaded
-
-                    for key in ["mppt_pv_power", "mppt_pv_voltage", "consumption", "charging"]:
-                        if key in history_data:
-                            history_data[key] = deque(history_data[key], maxlen=MAX_POINTS)
-
-            log_message(f"History erfolgreich aus {source} geladen.")
-
+                    history_data.update(data)
+            log_message("BMS-Historie (inkl. heute) von SD geladen.")
         except Exception as e:
-            log_message(f"History Laden Fehler: {e}", "ERROR")
+            log_message(f"Fehler beim Laden der BMS-Historie: {e}", "ERROR")
 
-    if os.path.exists(STATS_FILE):
+    if os.path.exists(CONSUMPTION_BACKUP_FILE):
         try:
-            with open(STATS_FILE, "r") as f:
-                stats = json.load(f)
-
-            with data_lock:
-                history_data["daily_cache"] = stats
-
-            log_message("Langzeit-Statistiken (daily_cache) geladen.")
-
+            with open(CONSUMPTION_BACKUP_FILE, "r") as f:
+                cons_data = json.load(f)
+                with data_lock:
+                    history_data["daily_cache"] = cons_data
+            log_message(f"Verbrauchshistorie ({len(cons_data)} Tage) von SD geladen.")
         except Exception as e:
-            log_message(f"Fehler beim Laden der Stats: {e}")
+            log_message(f"Fehler beim Laden der Verbrauchshistorie: {e}", "ERROR")
+
+def load_history():
+    global history_data
+    if os.path.exists(HISTORY_BACKUP_FILE):
+        try:
+            with open(HISTORY_BACKUP_FILE, "r") as f:
+                data = json.load(f)
+                with data_lock:
+                    history_data.update(data)
+            log_message("BMS-Historie (inkl. heute) von SD geladen.")
+        except Exception as e:
+            log_message(f"Fehler beim Laden der BMS-Historie: {e}", "ERROR")
+
+    if os.path.exists(CONSUMPTION_BACKUP_FILE):
+        try:
+            with open(CONSUMPTION_BACKUP_FILE, "r") as f:
+                cons_data = json.load(f)
+                with data_lock:
+                    history_data["daily_cache"] = cons_data
+            log_message(f"Verbrauchshistorie ({len(cons_data)} Tage) von SD geladen.")
+        except Exception as e:
+            log_message(f"Fehler beim Laden der Verbrauchshistorie: {e}", "ERROR")
 
 def save_history(backup=False):
-    """
-    Speichert Daten atomar. 24h-Chart bleibt kompakt, 
-    Monats-Statistiken werden lesbar (untereinander) gespeichert.
-    """
     try:
         with data_lock:
-            if not any(history_data.values()):
-                return
-
-            # Trenne die Daten für die unterschiedlichen Dateien
-            chart_data = {
-                k: list(v) if isinstance(v, deque) else v
-                for k, v in history_data.items()
-                if k != "daily_cache"
-            }
+            live_data = {k: v for k, v in history_data.items() if k != "daily_cache"}
+            cons_data = history_data.get("daily_cache", {}).copy()
             
-            stats_data = history_data.get("daily_cache", {})
+            today_str = datetime.now().strftime("%d.%m.")
+            current_today_kwh = 0.0
+            
+            if "consumption" in history_data and history_data["consumption"]:
+                total_w_minutes = sum(p.get("y", 0) for p in history_data["consumption"])
+                current_today_kwh = (total_w_minutes / 60.0) / 1000.0
+            
+            cons_data[today_str] = round(current_today_kwh, 3)
 
-        paths_to_save = [HISTORY_FILE]
+            try:
+                sorted_items = sorted(cons_data.items(), key=lambda x: datetime.strptime(x[0] + "2026", "%d.%m.%Y"))
+                cons_data_sorted = dict(sorted_items)
+            except Exception:
+                cons_data_sorted = cons_data
+
+            live_str = json.dumps(live_data, indent=4)
+            cons_str = json.dumps(cons_data_sorted, indent=4, sort_keys=False)
+
+        for path, content in [(HISTORY_FILE, live_str), (CONSUMPTION_FILE, cons_str)]:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + ".tmp", "w") as f: 
+                f.write(content)
+            os.replace(path + ".tmp", path)
+
         if backup:
-            paths_to_save.append(HISTORY_BACKUP_FILE)
-
-        for path in paths_to_save:
-            if os.path.dirname(path):
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(chart_data, f, separators=(',', ':'))
-            os.replace(tmp, path)
-
-        if os.path.dirname(STATS_FILE):
-            os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
-        tmp_s = STATS_FILE + ".tmp"
-        with open(tmp_s, "w") as f:
-            json.dump(stats_data, f, indent=4, ensure_ascii=False)
-        os.replace(tmp_s, STATS_FILE)
-
+            for path, content in [(HISTORY_BACKUP_FILE, live_str), (CONSUMPTION_BACKUP_FILE, cons_str)]:
+                if path:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path + ".tmp", "w") as f: 
+                        f.write(content)
+                    os.replace(path + ".tmp", path)
+                    
     except Exception as e:
-        log_message(f"Speicherfehler: {e}", "ERROR")
+        log_message(f"Fehler beim Speichern: {e}", "ERROR")
 
 def get_history_window():
     now = datetime.now()
@@ -462,29 +446,33 @@ def get_history_window():
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 def cleanup_old_data():
-    """Löscht alte Datenpunkte aus der Historie, ignoriert aber den Tages-Cache"""
-    if datetime.now().year < 2024:
-        log_message("Systemzeit ungenau (NTP fehlt) – Cleanup übersprungen.")
-        return
-
-    now = datetime.now()
-    cutoff_dt = now.replace(hour=HISTORY_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
-
-    if now < cutoff_dt:
-        cutoff_dt = cutoff_dt - timedelta(days=1)
-        
-    cutoff_ms = int(cutoff_dt.timestamp() * 1000)
-    
+    """Löscht veraltete Daten synchron zum eingestellten Tagesrhythmus."""
     with data_lock:
-        for k in list(history_data.keys()):
-            if isinstance(history_data[k], list):
-                history_data[k] = [
-                    p for p in history_data[k] 
-                    if isinstance(p, dict) and p.get("x", 0) > cutoff_ms
-                ]
-    
-    if DEBUG:
-        log_message(f"History-Cleanup: Daten vor {cutoff_dt.strftime('%d.%m. %H:%M')} gelöscht.")
+        now = datetime.now()
+
+        cutoff_time = (time.time() - (24 * 3600)) * 1000
+        for key in ["mppt_pv_power", "mppt_pv_voltage", "consumption", "charging"]:
+            if key in history_data and isinstance(history_data[key], list):
+                history_data[key] = [p for p in history_data[key] if p.get("x", 0) > cutoff_time]
+        
+        if "daily_cache" in history_data:
+
+            logischer_heute = now if now.hour >= HISTORY_WINDOW_START_HOUR else now - timedelta(days=1)
+            
+            valid_dates = []
+            for i in range(32):
+                date_str = (logischer_heute - timedelta(days=i)).strftime("%d.%m.")
+                valid_dates.append(date_str)
+            
+            original_count = len(history_data["daily_cache"])
+            history_data["daily_cache"] = {
+                date: val for date, val in history_data["daily_cache"].items() 
+                if date in valid_dates
+            }
+            
+            if original_count > len(history_data["daily_cache"]):
+                removed_count = original_count - len(history_data['daily_cache'])
+                log_message(f"Cleanup: {removed_count} Tage entfernt (Sync zu {HISTORY_WINDOW_START_HOUR}h)")
 
 def get_dbus_value_immediate(service, path):
     try:
@@ -495,93 +483,106 @@ def get_dbus_value_immediate(service, path):
         return None
 
 def history_autosaver():
+    """Speichert die aktuellen Live-Daten regelmäßig permanent auf die SD-Karte."""
     while True:
-        time.sleep(HISTORY_AUTOSAVE_INTERVAL)
-        save_history()
-
-LOOP_INTERVAL = 5
+        time.sleep(HISTORY_AUTOSAVE_INTERVAL * 60)
+        save_history(backup=True)
 
 def collect_data():
-    log_message("History-Sammler gestartet (5s Intervall mit Mittelwertbildung)")
+    log_message("History-Sammler gestartet (Zentraler Reset über HISTORY_WINDOW_START_HOUR)")
     global cell_daily_stats
     samples = []
     last_save_time = time.time()
 
     while True:
-        loop_start = time.time()
-
         try:
             now_dt = datetime.now()
-            reset_id = now_dt.strftime("%Y-%m-%d") if now_dt.hour >= HISTORY_WINDOW_START_HOUR else (now_dt - timedelta(days=1)).strftime("%Y-%m-%d")
-            
-            if cell_daily_stats.get('last_reset_day') != reset_id:
-                with data_lock:
-                    history_data["cell_stats"]['min'] = [4.5] * CELL_COUNT
-                    history_data["cell_stats"]['max'] = [0.0] * CELL_COUNT
-                    history_data["cell_stats"]['last_reset_day'] = reset_id
-                    cell_daily_stats = history_data["cell_stats"]
-                log_message(f"Zell-Tagesstatistik zurückgesetzt für {reset_id}")
-
             if now_dt.year < 2024:
                 time.sleep(30)
                 continue
 
-            with data_lock:
-                last_update_local = last_update
-                current_cells = list(bms_data.get('cells', []))
-                v = bms_data.get('voltage', 0)
-                p_pv = bms_data.get('pv_power', 0)
-                v_pv = bms_data.get('pv_voltage', 0)
-                p_batt = bms_data.get('power', 0)
+            if now_dt.hour == HISTORY_WINDOW_START_HOUR and now_dt.minute == 0 and now_dt.second < 10:
+                with data_lock:
+                    cons_history = list(history_data.get("consumption", []))
+                    if cons_history:
+                        total_wh = sum(p.get("y", 0) for p in cons_history) / 60.0
+                        kwh_today = round(total_wh / 1000.0, 3)
+                        
+                        yesterday_str = (now_dt - timedelta(days=1)).strftime("%d.%m.")
+                        if "daily_cache" not in history_data:
+                            history_data["daily_cache"] = {}
+                        history_data["daily_cache"][yesterday_str] = kwh_today
+                        log_message(f"Tagesverbrauch archiviert: {yesterday_str} = {kwh_today} kwh")
 
-            if time.time() - (last_update_local / 1000) > 10:
-                time.sleep(5)
-                continue
+                    cleanup_old_data()
+                    
+                    history_data["consumption"] = []
+                    history_data["charging"] = []
+                    history_data["mppt_pv_power"] = []
+                    history_data["mppt_pv_voltage"] = []
+                    log_message(f"Tages-Reset der Live-Listen durchgeführt (Stunde: {HISTORY_WINDOW_START_HOUR})")
+                
 
-            for i, val in enumerate(current_cells):
-                if val > 2.0 and i < len(cell_daily_stats['min']):
-                    if val < cell_daily_stats['min'][i]:
-                        cell_daily_stats['min'][i] = val
-                    if val > cell_daily_stats['max'][i]:
-                        cell_daily_stats['max'][i] = val
-
-            if v <= 0.1:
+                save_history(backup=True)
                 time.sleep(10)
-                continue
 
-            samples.append({
-                'p_pv': p_pv,
-                'v_pv': v_pv,
-                'p_batt': p_batt
-            })
+            reset_id = now_dt.strftime("%Y-%m-%d") if now_dt.hour >= HISTORY_WINDOW_START_HOUR else (now_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+            
+            with data_lock:
+                if cell_daily_stats.get('last_reset_day') != reset_id:
+                    cell_daily_stats['min'] = [4.5] * CELL_COUNT
+                    cell_daily_stats['max'] = [0.0] * CELL_COUNT
+                    cell_daily_stats['last_reset_day'] = reset_id
+                    log_message(f"Zell-Tagesstatistik zurückgesetzt für {reset_id}")
+
+                if time.time() - (last_update / 1000) <= 10:
+                    current_cells = bms_data.get('cells', [])
+                    for i, v in enumerate(current_cells):
+                        if i < CELL_COUNT and v > 2.0:
+                            if v < cell_daily_stats['min'][i]: cell_daily_stats['min'][i] = v
+                            if v > cell_daily_stats['max'][i]: cell_daily_stats['max'][i] = v
+                    
+                    samples.append({
+                        'p_pv': bms_data.get('pv_power', 0),
+                        'v_pv': bms_data.get('pv_voltage', 0),
+                        'p_batt': bms_data.get('power', 0)
+                    })
 
             now = time.time()
             if now - last_save_time >= 60:
                 if samples:
-                    avg = {k: sum(s[k] for s in samples) / len(samples) for k in ['p_pv', 'v_pv', 'p_batt']}
+                    avg_pv = sum(s['p_pv'] for s in samples) / len(samples)
+                    avg_v_pv = sum(s['v_pv'] for s in samples) / len(samples)
+                    avg_batt = sum(s['p_batt'] for s in samples) / len(samples)
                     now_ms = int(now * 1000)
+                    
+                    with data_lock:
+                        actual_cons = max(0, avg_pv - avg_batt) 
+                        history_data["mppt_pv_power"].append({"x": now_ms, "y": round(avg_pv)})
+                        history_data["mppt_pv_voltage"].append({"x": now_ms, "y": round(avg_v_pv, 1)})
+                        history_data["consumption"].append({"x": now_ms, "y": round(actual_cons)})
+                        history_data["charging"].append({"x": now_ms, "y": round(max(0, avg_batt))})
+
+                if USE_VICTRON_DAILY_YIELD and mppt_services:
+                    vy_today = get_mppt_daily_yield(0)
+                    vy_yesterday = get_mppt_daily_yield(1)
+                    if now_dt.hour < HISTORY_WINDOW_START_HOUR:
+                        vy_today = 0.0 
 
                     with data_lock:
-                        p_pv = avg['p_pv']
-                        p_batt = avg['p_batt']
-                        actual_cons = max(0, p_pv - p_batt)
-
-                        history_data["mppt_pv_power"].append({"x": now_ms, "y": round(p_pv)})
-                        history_data["mppt_pv_voltage"].append({"x": now_ms, "y": round(avg['v_pv'], 1)})
-                        history_data["consumption"].append({"x": now_ms, "y": round(actual_cons)})
-                        history_data["charging"].append({"x": now_ms, "y": round(max(0, p_batt))})
+                        if vy_today is not None: bms_data['daily_pv_yield'] = round(vy_today, 3)
+                        if vy_yesterday is not None: bms_data['yield_yesterday'] = round(vy_yesterday, 3)
 
                 cleanup_old_data()
-                samples.clear()
+                save_history(backup=False) 
+                
+                samples = []
                 last_save_time = now
 
+            time.sleep(5)
         except Exception as e:
             log_message(f"collect_data Fehler: {e}", "ERROR")
-            samples.clear()
             time.sleep(10)
-
-        elapsed = time.time() - loop_start
-        time.sleep(max(0, LOOP_INTERVAL - elapsed))
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
@@ -596,72 +597,64 @@ class BMSHandler(BaseHTTPRequestHandler):
         try:
             path_parts = self.path.split('/')
             if len(path_parts) < 3:
-                return
-
-            target = path_parts[2].split('?')[0]
+                raise ValueError("Keine IP angegeben")
             
-            if target not in TASMOTA_IPS:
-                log_message(f"Unautorisierter Tasmota-Zugriff: {target}", "WARNING")
-                self.send_error(403, "IP not authorized")
-                return
-
-            query = "Power"
-            if 'cmd=' in self.path:
-                query = self.path.split('cmd=')[1]
-
-            url = f"http://{target}/cm?cmnd={query}"
+            ip = path_parts[2].split('?')[0]
+            query = self.path.split('cmd=')[1] if 'cmd=' in self.path else 'Power'
             
+            if ip not in TASMOTA_IPS:
+                raise ValueError(f"Unbekannte Tasmota-IP: {ip}")
+            
+            url = f"http://{ip}/cm?cmnd={query}"
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=2.5) as response:
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(response.read())
-                
+            with urllib.request.urlopen(req, timeout=4) as response:
+                res_data = response.read()
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(res_data)
         except Exception as e:
-            log_message(f"Tasmota Proxy Fehler: {e}", "DEBUG")
+            log_message(f"Tasmota Proxy Fehler {self.path}: {e}", "ERROR")
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({"POWER": "OFF", "State": "Offline"}).encode())
+            fallback = {"POWER": "OFF"}
+            if "FriendlyName1" in self.path:
+                fallback["FriendlyName1"] = "Offline"
+            self.wfile.write(json.dumps(fallback).encode())
 
     def serve_history30(self):
-        """Liest Ertrag vom MPPT und Verbrauch (max 30 Tage)"""
         data30 = []
         now = datetime.now()
 
-        allowed_days = [(now - timedelta(days=i)).strftime("%d.%m.") for i in range(32)]
-        
-        with data_lock:
-            if "daily_cache" not in history_data:
-                history_data["daily_cache"] = {}
-            
-            daily_cache = history_data["daily_cache"]
+        if now.hour < HISTORY_WINDOW_START_HOUR:
+            current_logical_day = now - timedelta(days=1)
+        else:
+            current_logical_day = now
 
-            keys_to_delete = [k for k in daily_cache.keys() if k not in allowed_days]
-            for k in keys_to_delete:
-                del daily_cache[k]
+        with data_lock:
+            cons_history = list(history_data.get("consumption", []))
+            total_cons_wh = sum(p.get("y", 0) for p in cons_history) / 60.0
+            live_today_kwh = round(total_cons_wh / 1000.0, 3)
+            cache = history_data.get("daily_cache", {})
 
         for i in range(29, -1, -1):
-            target_date = now - timedelta(days=i)
+            target_date = current_logical_day - timedelta(days=i)
             day_str = target_date.strftime("%d.%m.")
             
             yield_val = get_mppt_daily_yield(i) or 0
             
             if i == 0:
-                with data_lock:
-                    history_cons = list(history_data.get("consumption", []))
-                    total_cons_wh = sum(p.get("y", 0) for p in history_cons) / 60.0
-                    day_cons_kwh = round(total_cons_wh / 1000.0, 3)
-                    daily_cache[day_str] = day_cons_kwh
+                day_cons = live_today_kwh
             else:
-                day_cons_kwh = daily_cache.get(day_str, 0)
+                day_cons = cache.get(day_str, 0)
 
             data30.append({
                 "day": day_str, 
-                "yield": round(yield_val, 2),
-                "consumption": day_cons_kwh
+                "yield": round(yield_val, 3),
+                "consumption": round(day_cons, 3)
             })
         
         self.send_response(200)
@@ -700,11 +693,7 @@ class BMSHandler(BaseHTTPRequestHandler):
     def serve_static(self):
         """Serviert statische Dateien wie chart.js"""
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        safe_path = os.path.normpath(self.path).lstrip('/')
-        path = os.path.join(base_dir, safe_path)
-        if not path.startswith(base_dir):
-            self.send_error(403)
-            return
+        path = os.path.join(base_dir, self.path.lstrip('/'))
         if not os.path.isfile(path):
             self.send_error(404)
             return
@@ -719,10 +708,7 @@ class BMSHandler(BaseHTTPRequestHandler):
         """Bereitet aktuelle BMS-Daten für das Frontend auf"""
         with data_lock:
             d = bms_data.copy()
-            
-            cutoff_ms, _ = get_history_window()
-            
-            history_cons = [p for p in history_data.get("consumption", []) if p.get("x", 0) >= cutoff_ms]
+            history_cons = history_data.get("consumption", [])
             total_cons_wh = sum(p.get("y", 0) for p in history_cons) / 60.0
             daily_consumption = round(total_cons_wh / 1000.0, 3)
 
@@ -733,32 +719,16 @@ class BMSHandler(BaseHTTPRequestHandler):
         bal_active = (delta > BALANCING_START_DELTA) and (maxc >= BALANCING_START_VOLTAGE)
         bal_text = "⚡" if bal_active else "Inaktiv"
         bal_color = "#ff9500" if bal_active else "#888"
-        current_pv = d.get('pv_power', 0)
+        
         current_batt = d.get('power', 0)
-        house_power = round(max(0, current_pv - current_batt))
 
         monthly_yield = 0.0
-        monthly_consumption = 0.0
-        
-        with data_lock:
-            if "daily_cache" not in history_data:
-                history_data["daily_cache"] = {}
-            daily_cache = history_data["daily_cache"].copy()
-
         if mppt_services:
             for i in range(30):
-                y_val = get_mppt_daily_yield(i)
-                if y_val: monthly_yield += y_val
-                
-                target_date = datetime.now() - timedelta(days=i)
-                day_str = target_date.strftime("%d.%m.")
-                if i == 0:
-                    monthly_consumption += daily_consumption
-                else:
-                    monthly_consumption += daily_cache.get(day_str, 0)
+                val = get_mppt_daily_yield(i)
+                if val: monthly_yield += val
 
         data = {
-            "timestamp": last_update,
             "soc": d.get('soc', 0),
             "voltage": d.get('voltage', 0),
             "dbus_ok": d.get("dbus_ok", False),
@@ -778,7 +748,6 @@ class BMSHandler(BaseHTTPRequestHandler):
             "pv_power": round(d.get('pv_power', 0)),
             "daily_pv_yield": round(d.get('daily_pv_yield', 0), 3),
             "daily_consumption": daily_consumption,
-            "monthly_consumption": round(monthly_consumption, 3),
             "monthly_yield": round(monthly_yield, 2)
         }
 
@@ -906,8 +875,8 @@ class BMSHandler(BaseHTTPRequestHandler):
         <div class="info"><span class="info-label">PV (MPPT V)</span><strong id="pv_voltage">0.0 V</strong></div>
         <div class="info"><span class="info-label">PV (MPPT Watt)</span><strong id="pv_power">0 W</strong></div>
         <!-- <div class="info"><span class="info-label">Lade/Entladung</span><strong id="power">0 W</strong></div> -->
+        <div class="info"><span class="info-label">Tagesverbrauch</span><strong id="daily_consumption">0 W</strong></div>
         <div class="info" onclick="toggleYieldDisplay()" style="cursor:pointer"><span class="info-label" id="yield-label">Tagesertrag</span><strong id="daily_pv_yield">0 W</strong></div>
-        <div class="info" onclick="toggleConsumptionDisplay()" style="cursor:pointer"><span class="info-label" id="consumption-label">Tagesverbrauch</span><strong id="daily_consumption">0 W</strong></div>
         <div class="info"><span class="info-label">Balancing</span><strong id="balancing">—</strong></div>
         <div class="info"><span class="info-label">Zellen-Diff</span><strong id="delta">— V</strong></div>
     </div>
@@ -923,53 +892,51 @@ class BMSHandler(BaseHTTPRequestHandler):
         </div>
     </div>
 
-    <div class="footer">Solar Dashboard {VERSION} – Datum: <span id="current-date">00.00.0000</span> – Läuft seit: <span id="uptime">00:00:00</span> Stunden</div>
+    <div class="footer">JK-BMS Dashboard {VERSION} – Läuft seit: <span id="uptime">00:00:00</span></div>
 </div>
 
 <script>
 const MAX_CHART_POINTS = 2000;
-let mpptChart = null;
-let wakeLock = null; 
-let lastBalancingState = false;
-let showMonthly = false;
-let showMonthlyCons = false;
-let currentYieldToday = 0;
-let currentMonthlyYield = 0;
-let currentConsToday = 0;
-let currentMonthlyCons = 0;
-let retryDelay = 1500;
-const MAX_RETRY_DELAY = 10000;
+        let mpptChart = null;
+        let wakeLock = null; 
+        let lastBalancingState = false;
+        let showMonthly = false;
+        let currentYieldToday = 0;
+        let currentMonthlyYield = 0;
+        let retryDelay = 1500;
+        const MAX_RETRY_DELAY = 10000;
 
-async function requestWakeLock() {{
-    try {{
-        if ('wakeLock' in navigator) {{
-            wakeLock = await navigator.wakeLock.request('screen');
-            console.log('Wake Lock aktiv');
+        async function requestWakeLock() {{
+            try {{
+                if ('wakeLock' in navigator) {{
+                    wakeLock = await navigator.wakeLock.request('screen');
+                    console.log('Wake Lock aktiv');
+                }}
+            }} catch (err) {{
+                console.error(`${{err.name}}, ${{err.message}}`);
+            }}
         }}
-    }} catch (err) {{
-        console.error(`${{err.name}}, ${{err.message}}`);
-    }}
-}}
 
-function releaseWakeLock() {{
-    if (wakeLock !== null) {{
-        wakeLock.release();
-        wakeLock = null;
-        console.log('Wake Lock freigegeben');
-    }}
-}}
+        function releaseWakeLock() {{
+            if (wakeLock !== null) {{
+                wakeLock.release();
+                wakeLock = null;
+                console.log('Wake Lock freigegeben');
+            }}
+        }}
 
-const fullscreenChangeHandler = async () => {{
-    if (document.fullscreenElement || document.webkitFullscreenElement) {{
-        await requestWakeLock();
-    }} else {{
-        releaseWakeLock();
-    }}
-}};
+        const fullscreenChangeHandler = async () => {{
+            if (document.fullscreenElement || document.webkitFullscreenElement) {{
+                await requestWakeLock();
+            }} else {{
+                releaseWakeLock();
+            }}
+        }};
 
-document.addEventListener('fullscreenchange', fullscreenChangeHandler);
-document.addEventListener('webkitfullscreenchange', fullscreenChangeHandler);
+        document.addEventListener('fullscreenchange', fullscreenChangeHandler);
+        document.addEventListener('webkitfullscreenchange', fullscreenChangeHandler);
 
+// === Hover Logik für Buttons ===
 let idleTimer;
 const themeBtn = document.getElementById('theme-toggle');
 const tempBtn = document.getElementById('temp-circle');
@@ -980,14 +947,14 @@ function showControls() {{
     if (document.getElementById('temperature').textContent !== '—') {{
         tempBtn.classList.add('controls-visible');
     }}
-    document.querySelectorAll('.tasmota-circle').forEach(el => el.classList.add('controls-visible'));
-
+    document.querySelectorAll('.tasmota-circle').forEach(el => el.classList.add('controls-visible'));  // ← neu
+    
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {{
         themeBtn.classList.remove('controls-visible');
         tempBtn.classList.remove('controls-visible');
-        document.querySelectorAll('.tasmota-circle').forEach(el => el.classList.remove('controls-visible'));
-    }}, 3500);
+        document.querySelectorAll('.tasmota-circle').forEach(el => el.classList.remove('controls-visible'));  // ← neu
+    }}, 3500);  // ← Timeout auf 3500 erhöht für mehr Platz
 }}
 
 window.addEventListener('mousemove', showControls);
@@ -995,44 +962,25 @@ window.addEventListener('touchstart', showControls);
 
 // Restliche Dashboard Logik...
 function toggleYieldDisplay() {{
-    showMonthly = !showMonthly;
-    document.getElementById('yield-label').textContent = 
-        showMonthly ? "Monatsertrag" : "Tagesertrag";
-    updateYieldDisplay();
-}}
+            showMonthly = !showMonthly;
+            document.getElementById('yield-label').textContent = 
+                showMonthly ? "Monatsertrag" : "Tagesertrag";
+            updateYieldDisplay();
+        }}
 
-function updateYieldDisplay() {{
-    const isM = showMonthly;
-    const val = isM ? currentMonthlyYield : currentYieldToday;
-    const el = document.getElementById('daily_pv_yield');
-
-    if (val >= 10)      el.textContent = val.toFixed(1) + ' kW';
-    else if (val >= 1)  el.textContent = val.toFixed(2) + ' kW';
-    else                el.textContent = Math.round(val * 1000) + ' W';
-
-    el.style.color = val > 0 ? (isM ? '#ff9500' : '#00ff00') : 'var(--gray)';
-}}
-
-function toggleConsumptionDisplay() {{
-    showMonthlyCons = !showMonthlyCons;
-    document.getElementById('consumption-label').textContent = 
-        showMonthlyCons ? "Monatsverbrauch" : "Tagesverbrauch";
-    updateConsumptionDisplay();
-}}
-
-function updateConsumptionDisplay() {{
-    const isM = showMonthlyCons;
-    const val = isM ? currentMonthlyCons : currentConsToday;
-    const el = document.getElementById('daily_consumption');
-
-    const valWh = val * 1000;
-    if (valWh < 1000) {{
-    el.textContent = Math.round(valWh) + ' W';
-    }} else {{
-    el.textContent = val.toFixed(2) + ' kW';
-    }}
-    el.style.color = val > 0.001 ? (isM ? '#ff9500' : '#f00') : 'var(--gray)';
-}}
+        function updateYieldDisplay() {{
+            const isM = showMonthly;
+            const val = isM ? currentMonthlyYield : currentYieldToday;
+            const el = document.getElementById('daily_pv_yield');
+            
+            if (val >= 10)      el.textContent = val.toFixed(1) + ' kw';
+            else if (val >= 1)  el.textContent = val.toFixed(2) + ' kw';
+            else                el.textContent = Math.round(val * 1000) + ' W';
+            
+            el.style.color = val > 0 
+                ? (isM ? '#ff9500' : '#00ff00') 
+                : 'var(--gray)';
+        }}
 
 let theme = localStorage.getItem('theme') || 'dark';
 document.documentElement.setAttribute('data-theme', theme);
@@ -1060,6 +1008,7 @@ tempBtn.onclick = async () => {{
     }}
 }};
 
+// Automatisches Re-Aktivieren, wenn man zum Tab zurückkehrt (nur im Fullscreen)
 document.addEventListener('visibilitychange', async () => {{
     if ((document.fullscreenElement || document.webkitFullscreenElement) && document.visibilityState === 'visible') {{
         await requestWakeLock();
@@ -1068,15 +1017,7 @@ document.addEventListener('visibilitychange', async () => {{
 
 const startTime = {start_ts};
 function updateUptime() {{
-    const now = new Date();
-    const dateStr = now.toLocaleDateString('de-DE', {{ 
-        day: '2-digit', 
-        month: '2-digit', 
-        year: 'numeric' 
-    }});
-    document.getElementById('current-date').textContent = dateStr;
-
-    let s = Math.floor((now.getTime() - startTime) / 1000);
+    let s = Math.floor((Date.now() - startTime) / 1000);
     let h = Math.floor(s / 3600).toString().padStart(2, '0');
     let m = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
     let sec = (s % 60).toString().padStart(2, '0');
@@ -1101,18 +1042,26 @@ function initMpptChart() {{
                 easing: 'easeOutQuart'
             }},
             maintainAspectRatio: false,
-            // Das sorgt dafür, dass die Linie reagiert, wenn man nah dran ist
             interaction: {{
-                mode: 'nearest',
-                intersect: true,
-                axis: 'xy'
+                mode: 'index',
+                intersect: false
             }},
             plugins: {{
                 legend: {{ position: 'top' }},
                 tooltip: {{
                     enabled: true,
                     position: 'nearest',
-                    // Entferne hier den 'external' Block, falls er noch da ist
+                    external: function(context) {{
+                        const tooltipModel = context.tooltip;
+                        if (tooltipModel.opacity !== 0) {{
+                            if (window.mpptTimer) clearTimeout(window.mpptTimer);
+                            window.mpptTimer = setTimeout(() => {{
+                                tooltipModel.opacity = 0;
+                                context.chart.setActiveElements([]);
+                                context.chart.update();
+                            }}, 10000); // 10000ms = 10 Sekunden
+                        }}
+                    }},
                     callbacks: {{
                         label: function(context) {{
                             let label = context.dataset.label || '';
@@ -1120,23 +1069,12 @@ function initMpptChart() {{
                             let unit = context.dataset.yAxisID === 'y' ? ' V' : ' W';
                             
                             if (unit === ' W') {{
-                                if (Math.abs(val) >= 1000) return label + ': ' + (val / 1000).toFixed(2) + ' kW';
+                                if (Math.abs(val) >= 1000) return label + ': ' + (val / 1000).toFixed(2) + ' kw';
                                 return label + ': ' + Math.round(val) + ' W';
                             }}
                             return label + ': ' + val.toFixed(2) + unit;
                         }}
                     }}
-                }}
-            }},
-            // Diese Sektion ist neu/wichtig für das Treffen der Linie:
-            elements: {{
-                point: {{
-                    radius: 0.1,      // Sichtbarer Punkt bleibt klein
-                    hitRadius: 20,    // Klick-Bereich wird größer (10px um den Punkt/Linie)
-                    hoverRadius: 5    // Punkt wird beim Drüberfahren leicht größer
-                }},
-                line: {{
-                    borderWidth: 1
                 }}
             }},
             scales: {{
@@ -1165,7 +1103,7 @@ function initMpptChart() {{
 function cleanupChartData() {{
     const now = new Date();
     let cutoffDate = new Date();
-    cutoffDate.setHours({HISTORY_WINDOW_START_HOUR}, 0, 0, 0); 
+    cutoffDate.setHours(4, 0, 0, 0);
     if (now < cutoffDate) {{
         cutoffDate.setDate(cutoffDate.getDate() - 1);
     }}
@@ -1252,7 +1190,7 @@ function updateData() {{
         const socEl = document.getElementById('soc');
         socEl.innerHTML = s.toFixed(0) + '<span>%</span>';
         socEl.style.color = s >= 95 ? '#0f0' : s >= 70 ? '#ff0' : s >= 40 ? '#ff9500' : '#f00';
-        socEl.style.animation = s <= 25 ? 'blink 1s infinite' : 'none';
+        socEl.style.animation = s <= 25 ? 'blink 1s infinite' : (data.current >= {MIN_CHARGE_CURRENT_FOR_PULSE}) ? 'blink 3s infinite ease-in-out' : 'none';
 
         if (v > 1.0) {{
             hv_warn.style.display = v >= {MAX_PACK_VOLTAGE_WARNING} ? 'block' : 'none';
@@ -1326,11 +1264,23 @@ function updateData() {{
 
         currentYieldToday = data.daily_pv_yield || 0;
         currentMonthlyYield = data.monthly_yield || 0;
-        currentConsToday = data.daily_consumption || 0;
-        currentMonthlyCons = data.monthly_consumption || 0;
-        
+        const consVal = data.daily_consumption || 0;
+        const consEl = document.getElementById('daily_consumption');
+        const consWh = consVal * 1000; //
+
+        if (consWh < 1000) {{
+            consEl.textContent = Math.round(consWh) + ' W';
+        }} else {{
+            consEl.textContent = consVal.toFixed(2) + ' kw';
+        }}
+
+        // Farbe steuern: Grau wenn 0, sonst Rot
+        if (consVal <= 0.001) {{
+            consEl.style.color = 'var(--gray)';
+        }} else {{
+            consEl.style.color = '#f00';
+        }}
         updateYieldDisplay();
-        updateConsumptionDisplay();
 
         if (data.temperature !== null && data.temperature > -40) {{
             document.getElementById('temperature').textContent = Math.round(data.temperature) + '°';
@@ -1379,21 +1329,21 @@ function updateData() {{
             if (warnCellEl.innerHTML !== ico) warnCellEl.innerHTML = ico;
         }});
 
-        const serverTs = data.timestamp; 
+        const now = Date.now();
         const lastDs = mpptChart.data.datasets[0].data;
         const lastTs = lastDs.length > 0 ? lastDs[lastDs.length - 1].x : 0;
 
-        // Im f-String müssen Klammern verdoppelt werden: {{ }}
-        if (serverTs > lastTs) {{
+        if (now - lastTs > 60000 || lastDs.length === 0) {{
             const pwr_pv = data.pv_power || 0;
             const pwr_batt = data.battery_power || 0;
             const pwr_cons = Math.max(0, pwr_pv - pwr_batt); 
 
-            mpptChart.data.datasets[0].data.push({{ x: serverTs, y: pwr_pv }});
-            mpptChart.data.datasets[1].data.push({{ x: serverTs, y: data.pv_voltage || 0 }});
-            mpptChart.data.datasets[2].data.push({{ x: serverTs, y: pwr_cons }});
-            mpptChart.data.datasets[3].data.push({{ x: serverTs, y: pwr_batt }});
+            mpptChart.data.datasets[0].data.push({{ x: now, y: pwr_pv }});
+            mpptChart.data.datasets[1].data.push({{ x: now, y: data.pv_voltage || 0 }});
+            mpptChart.data.datasets[2].data.push({{ x: now, y: pwr_cons }});
+            mpptChart.data.datasets[3].data.push({{ x: now, y: pwr_batt }});
 
+            // Verhindert das Explodieren der Datenmenge im Browser-RAM
             if (mpptChart.data.datasets[0].data.length > MAX_CHART_POINTS) {{
                 mpptChart.data.datasets.forEach(ds => ds.data.shift());
             }}
@@ -1401,7 +1351,6 @@ function updateData() {{
             cleanupChartData();
             mpptChart.update('none');
         }}
-        
         setTimeout(updateData, 2000);
     }})
     .catch(() => {{
@@ -1411,6 +1360,7 @@ function updateData() {{
     }});
 }}
 
+// ── Tasmota Steuerung ──
 const tasmotaIps = {tasmota_ips_json};
 const tasmotaContainer = document.getElementById('tasmota-container');
 
@@ -1559,7 +1509,7 @@ function initHistory30Chart() {{
                         label: function(context) {{
                             let label = context.dataset.label || '';
                             let val = context.parsed.y;
-                            if (val >= 1) return label + ': ' + val.toFixed(2) + ' kW';
+                            if (val >= 1) return label + ': ' + val.toFixed(2) + ' kw';
                             return label + ': ' + (val * 1000).toFixed(0) + ' W';
                         }}
                     }}
@@ -1571,16 +1521,19 @@ function initHistory30Chart() {{
                     display: true,
                     position: 'left',
                     beginAtZero: true,
-                    grace: '5%', 
+                    // "grace" wird oft von der Tick-Berechnung ignoriert, 
+                    // wenn Chart.js "schöne" Zahlen bevorzugt.
+                    // Wir lassen es drin, fügen aber eine Berechnung für das Ende hinzu:
+                    grace: '2%', 
                     title: {{ display: true, text: 'Energie' }},
                     grid: {{ color: 'rgba(255, 255, 255, 0.03)' }},
                     ticks: {{
                         precision: 3,
                         autoSkip: true,
-                        maxTicksLimit: 8,
+                        maxTicksLimit: 10, // Erhöht für feinere Abstufung
                         callback: function(value) {{
                             if (value === 0) return '0';
-                            if (value >= 1) return value.toFixed(1) + ' kW';
+                            if (value >= 1) return value.toFixed(1) + ' kw';
                             return (value * 1000).toFixed(0) + ' W';
                         }}
                     }}
@@ -1590,6 +1543,7 @@ function initHistory30Chart() {{
                     display: true,
                     position: 'right',
                     beginAtZero: true,
+                    // Diese Funktion koppelt die rechte Achse an die linke
                     afterDataLimits: axis => {{
                         axis.min = axis.chart.scales.y.min;
                         axis.max = axis.chart.scales.y.max;
@@ -1600,7 +1554,7 @@ function initHistory30Chart() {{
                         precision: 3,
                         callback: function(value) {{
                             if (value === 0) return '0';
-                            if (value >= 1) return value.toFixed(1) + ' kW';
+                            if (value >= 1) return value.toFixed(1) + ' kw';
                             return (value * 1000).toFixed(0) + ' W';
                         }}
                     }}
@@ -1625,7 +1579,7 @@ function loadHistory30() {{
 // Aufrufe am Ende des Scripts innerhalb des f-Strings:
 initHistory30Chart();
 loadHistory30();
-setInterval(loadHistory30, 3600000);
+setInterval(loadHistory30, 30000);
 </script>
 </body>
 </html>"""

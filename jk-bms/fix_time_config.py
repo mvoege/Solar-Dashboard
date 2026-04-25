@@ -1,52 +1,76 @@
 import os
-import subprocess
 
 def update_config():
+    # Konfiguration
     ntp_servers = "ptbtime1.ptb.de,ptbtime2.ptb.de,0.de.pool.ntp.org"
     config_path = "/etc/connman/main.conf"
     target_zone = "/usr/share/zoneinfo/Europe/Berlin"
     
-    # 1. Zeitzone korrigieren
-    # Wir prüfen, ob der Link existiert und korrekt auf Berlin zeigt
-    try:
-        current_link = os.readlink("/etc/localtime") if os.path.islink("/etc/localtime") else ""
-        if current_link != target_zone:
-            os.system(f"ln -sf {target_zone} /etc/localtime")
-    except OSError:
-        os.system(f"ln -sf {target_zone} /etc/localtime")
+    print("Starte Konfigurations-Check...")
 
-    # 2. NTP Config in /etc/connman/main.conf prüfen/schreiben
+    # --- 1. ZEITZONE PRÜFEN ---
+    is_zone_correct = False
+    if os.path.islink("/etc/localtime"):
+        if os.path.realpath("/etc/localtime") == target_zone:
+            is_zone_correct = True
+
+    if not is_zone_correct:
+        print(f"Update: Setze Zeitzone auf {target_zone}")
+        os.system("mount -o remount,rw /")
+        os.system("rm -f /etc/localtime")
+        os.system(f"ln -s {target_zone} /etc/localtime")
+    else:
+        print("Zeitzone ist bereits korrekt.")
+
+    # --- 2. NTP CONFIG PRÜFEN ---
+    updated_ntp = False
     if os.path.exists(config_path):
         with open(config_path, "r") as f:
             lines = f.readlines()
         
-        updated = False
         new_lines = []
+        found_key = False
         
-        # Wir prüfen jede Zeile. Wenn die Fallback-Server nicht passen, ersetzen wir sie.
         for line in lines:
-            if line.startswith("FallbackTimeservers="):
-                # Nur aktualisieren, wenn die gewünschten Server noch nicht drin stehen
-                if ntp_servers not in line:
+            stripped = line.strip()
+            if stripped.startswith("FallbackTimeservers="):
+                found_key = True
+                current_value = stripped.split("=", 1)[1]
+                if current_value != ntp_servers:
                     new_lines.append(f"FallbackTimeservers={ntp_servers}\n")
-                    updated = True
+                    updated_ntp = True
                 else:
                     new_lines.append(line)
             else:
                 new_lines.append(line)
         
-        # Falls die Zeile "FallbackTimeservers" komplett fehlte (unwahrscheinlich, aber sicher ist sicher)
-        if not any(l.startswith("FallbackTimeservers=") for l in new_lines):
+        if not found_key:
             new_lines.append(f"FallbackTimeservers={ntp_servers}\n")
-            updated = True
-        
-        if updated:
+            updated_ntp = True
+
+        if updated_ntp:
+            print(f"Update: Aktualisiere NTP Server in {config_path}")
+            os.system("mount -o remount,rw /")
             with open(config_path, "w") as f:
                 f.writelines(new_lines)
             
-            # 3. ConnMan neu starten (Der Weg, der bei dir funktioniert hat)
-            # Nutzt den absoluten Pfad für die Ausführung beim Booten
+            # ConnMan neu starten, um Config zu laden
             os.system("/etc/init.d/connman restart")
+        else:
+            print("NTP Konfiguration ist bereits korrekt.")
+
+    # --- 3. ZEIT-SYNCHRONISATION ERZWINGEN ---
+    # Falls wir etwas geändert haben oder die Zeit manuell triggern wollen
+    if not is_zone_correct or updated_ntp:
+        print("Erzwinge Zeit-Synchronisation via BusyBox...")
+        # Nutzt den ersten Server aus der Liste für einen schnellen Sync
+        first_server = ntp_servers.split(',')[0]
+        os.system(f"busybox ntpd -q -p {first_server}")
+
+    # --- 4. DATEISYSTEM ABSICHERN ---
+    # Wir setzen es am Ende immer sicherheitshalber auf RO
+    os.system("mount -o remount,ro /")
+    print("Vorgang abgeschlossen. Dateisystem ist wieder Read-Only.")
 
 if __name__ == "__main__":
     update_config()
