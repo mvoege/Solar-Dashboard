@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Solar Dashboard – by M.Vöge (mit Chart-Optimierungen)
+# JK-BMS Dashboard – Version 1.9.5 by M.Vöge (mit Chart-Optimierungen)
 # for Venus OS Large 3.7x Raspberry Pi
 # D-Bus-Treiber wird benötigt von https://github.com/mr-manuel/venus-os_dbus-serialbattery
 
@@ -22,7 +22,6 @@ from dbus.mainloop.glib import DBusGMainLoop
 # ====================================== WARNSTUFEN – HIER ANPASSEN =======================================
 # D-Bus anpassen! Prüfe mit: dbus -y | grep battery
 DASHBOARD_NAME = ""                                     # Tilel
-CELL_COUNT = 8                                          # Anzahl der Zellen 8
 MAX_PACK_VOLTAGE_WARNING = 29.40                        # Ab dieser Pack-Spannung: rote Warnung + Blinken
 MAX_CELL_VOLTAGE_WARNING = 3.65                         # Ab dieser Zellspannung: Zelle rot + ⚠️
 BALANCING_START_DELTA = 0.005                           # Ab dieser Delta gilt Balancing als aktiv
@@ -31,7 +30,6 @@ LOW_VOLTAGE_WARNING = 24.00                             # Warnung ab dieser Span
 LOW_SOC_WARNING = 25                                    # Warnung ab diesem SOC in % (0 = deaktivieren)
 MIN_CHARGE_CURRENT_FOR_PULSE = 1.0                      # Ladestrom muss mind. X A sein für Puls (Absorption)
 PORT = 99                                               # Webserver-Port (Standard: 99)
-HISTORY_WINDOW_START_HOUR = 0                           # Uhrzeit wann live Werte zurückgesetzt werden soll
 TASMOTA_IPS = ["192.168.0.14", "192.168.0.17"]          # Tasmota Geräte – IPs hier eintragen
 # =========================================================================================================
 battery_services = []
@@ -39,50 +37,26 @@ mppt_services = []
 primary_battery_service = None
 
 USE_VICTRON_DAILY_YIELD = True
-HISTORY_WINDOW_24H_MS = 24 * 60 * 60 * 1000
-HISTORY_AUTOSAVE_INTERVAL = 5
+HISTORY_AUTOSAVE_INTERVAL = 300
 
 DEBUG = False # False / True
 
-VERSION = "1.0.21"
+VERSION = "1.9.5"
 SCRIPT_PATH = os.path.abspath(__file__)
 SCRIPT_NAME = os.path.basename(__file__)
 LOG_FILE = "/var/volatile/tmp/jk_bms_dashboard.log"
 HISTORY_FILE = "/var/volatile/tmp/bms_history.json"
 HISTORY_BACKUP_FILE = "/data/apps/jk-bms/bms_history_backup.json"
-CONSUMPTION_FILE = "/var/volatile/tmp/consumption_history.json"
-CONSUMPTION_BACKUP_FILE = "/data/apps/jk-bms/consumption_backup.json"
 
 server_start_time = None
 history_data = {
     "mppt_pv_power":   [],
     "mppt_pv_voltage": [],
     "consumption":     [],
-    "charging":        [],
-    "cell_stats": {
-        'min': [4.5] * CELL_COUNT,
-        'max': [0.0] * CELL_COUNT,
-        'last_reset_day': None
-    }
+    "charging":        []
 }
 bms_data = {}
 data_lock = threading.Lock()
-cell_daily_stats = history_data["cell_stats"]
-
-def ensure_cell_stats():
-    global cell_daily_stats
-    with data_lock:
-        if "cell_stats" not in history_data or not isinstance(history_data["cell_stats"], dict):
-            history_data["cell_stats"] = {
-                'min': [4.5] * CELL_COUNT,
-                'max': [0.0] * CELL_COUNT,
-                'last_reset_day': None
-            }
-        if len(history_data["cell_stats"]['min']) != CELL_COUNT:
-            history_data["cell_stats"]['min'] = [4.5] * CELL_COUNT
-            history_data["cell_stats"]['max'] = [0.0] * CELL_COUNT
-            
-        cell_daily_stats = history_data["cell_stats"]
 last_update = 0
 
 DBUS_CACHE_TTL = 1.0
@@ -94,13 +68,8 @@ def log_message(message, level="INFO"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     full = f"[{timestamp}] [{level}] {message}"
     try:
-        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 1024 * 1024:
-            with open(LOG_FILE, 'w') as f:
-                f.write(f"[{timestamp}] [INFO] Log rotiert (Größe überschritten)\n")
-        
         with open(LOG_FILE, 'a') as f:
             f.write(full + "\n")
-            
         if DEBUG or level in ["ERROR", "WARNING"]:
             print(full)
     except:
@@ -215,14 +184,14 @@ def get_dbus_value(path, default=0, service=None):
 
     try:
         if key not in _dbus_item_cache:
-            # Nur loggen wenn wirklich neu, sonst wird das Log geflutet
+            log_message(f"Initialisiere D-Bus Pfad: {path} auf {current_service}")
             _dbus_item_cache[key] = VeDbusItemImport(bus, current_service, path)
         
         item = _dbus_item_cache[key]
         val = item.get_value()
         
         if val is None:
-            return default
+            val = default
 
         with _dbus_cache_lock:
             _dbus_cache[key] = (now, val)
@@ -230,11 +199,10 @@ def get_dbus_value(path, default=0, service=None):
         dbus_available = True
         return val
 
-    except:
+    except Exception as e:
+        if key in _dbus_item_cache:
+            del _dbus_item_cache[key]
         dbus_available = False
-        with _dbus_cache_lock:
-            if key in _dbus_cache:
-                return _dbus_cache[key][1]
         return default
 
 def discover_dbus_services():
@@ -254,7 +222,7 @@ def discover_dbus_services():
             if val is not None:
                 with data_lock:
                     bms_data['daily_pv_yield'] = round(float(val), 3)
-                log_message(f"Initialer Tagesertrag von {mppt} geladen: {val} kwh")
+                log_message(f"Initialer Tagesertrag von {mppt} geladen: {val} kWh")
             
             val_yesterday = get_dbus_value_immediate(mppt, '/History/Daily/1/Yield')
             if val_yesterday is not None:
@@ -285,22 +253,21 @@ def get_mppt_daily_yield(day_offset=0):
     return total if total > 0 else None
 
 def dbus_poller():
-    """Hält die D-Bus-Werte aktuell mit verbessertem Error-Handling."""
-    log_message("D-Bus Poller gestartet – robuste Version")
-    last_discovery = time.time()
-    error_streak = 0
-
+    log_message("D-Bus Poller gestartet")
+    consecutive_errors = 0
+    
     while True:
-        now = time.time()
-
-        if now - last_discovery > 60:
+        if not primary_battery_service or consecutive_errors > 5:
+            if consecutive_errors > 5:
+                log_message("Zu viele Fehler im Poller. Starte Neu-Erkennung der Dienste...", "WARNING")
+            else:
+                log_message("Warte auf Batterie-Dienst...", "WARNING")
+            
             discover_dbus_services()
-            last_discovery = now
-
-        if not primary_battery_service:
+            consecutive_errors = 0
             time.sleep(5)
             continue
-
+        
         try:
             temp = {
                 'soc':         get_dbus_value('/Soc'),
@@ -315,164 +282,108 @@ def dbus_poller():
                 'pv_power':    0.0,
             }
 
-            for i in range(1, CELL_COUNT + 1):
+            for i in range(1, 9):
                 v = get_dbus_value(f'/Voltages/Cell{i}')
-                if v is not None and isinstance(v, (int, float)) and v > 0.5:
-                    temp['cells'].append(round(float(v), 3))
+                if v is not None and v > 0.1:
+                    temp['cells'].append(round(v, 3))
+                else:
+                    break
+            
+            if not temp['cells']:
+                temp['cells'] = [0.000] * 8
 
             for svc in mppt_services:
-                try:
-                    v = get_dbus_value('/Pv/V', 0, svc) or get_dbus_value('/Pv/0/V', 0, svc)
-                    p = get_dbus_value('/Yield/Power', 0, svc) or get_dbus_value('/Pv/0/P', 0, svc)
-                    temp['pv_voltage'] += float(v or 0)
-                    temp['pv_power'] += float(p or 0)
-                except:
-                    continue
+                v = get_dbus_value('/Pv/V', 0, svc) or get_dbus_value('/Pv/0/V', 0, svc)
+                p = get_dbus_value('/Yield/Power', 0, svc) or get_dbus_value('/Pv/0/P', 0, svc)
+                temp['pv_voltage'] += v
+                temp['pv_power'] += p
 
             with data_lock:
                 bms_data.update(temp)
-                bms_data["dbus_ok"] = dbus_available
                 global last_update
+                bms_data["dbus_ok"] = dbus_available
                 last_update = int(time.time() * 1000)
-
-            error_streak = 0
-            time.sleep(1.3)
+            
+            consecutive_errors = 0
 
         except Exception as e:
-            error_streak += 1
-            if error_streak >= 3:
-                log_message(f"D-Bus Poller Fehler-Serie: {e}. Bereinige Cache...", "WARNING")
-                with _dbus_cache_lock:
-                    _dbus_cache.clear()
-                    _dbus_item_cache.clear()
-                discover_dbus_services()
-                error_streak = 0
-            time.sleep(2.0)
+            consecutive_errors += 1
+            log_message(f"Poller Fehler ({consecutive_errors}/5): {e}", "ERROR")
+            time.sleep(1)
+
+        time.sleep(1.0)
 
 def load_history():
     global history_data
-    if os.path.exists(HISTORY_BACKUP_FILE):
-        try:
-            with open(HISTORY_BACKUP_FILE, "r") as f:
-                data = json.load(f)
-                with data_lock:
-                    history_data.update(data)
-            log_message("BMS-Historie (inkl. heute) von SD geladen.")
-        except Exception as e:
-            log_message(f"Fehler beim Laden der BMS-Historie: {e}", "ERROR")
+    source = HISTORY_FILE
 
-    if os.path.exists(CONSUMPTION_BACKUP_FILE):
-        try:
-            with open(CONSUMPTION_BACKUP_FILE, "r") as f:
-                cons_data = json.load(f)
-                with data_lock:
-                    history_data["daily_cache"] = cons_data
-            log_message(f"Verbrauchshistorie ({len(cons_data)} Tage) von SD geladen.")
-        except Exception as e:
-            log_message(f"Fehler beim Laden der Verbrauchshistorie: {e}", "ERROR")
+    if not os.path.exists(source):
+        if os.path.exists(HISTORY_BACKUP_FILE):
+            mtime = os.path.getmtime(HISTORY_BACKUP_FILE)
+            age = time.time() - mtime
+            if age < 600:
+                source = HISTORY_BACKUP_FILE
+                log_message(f"Lade Backup aus /data (Alter: {int(age)}s)")
+            else:
+                log_message(f"Backup in /data zu alt ({int(age)}s), wird ignoriert.")
+                return
+        else:
+            return
 
-def load_history():
-    global history_data
-    if os.path.exists(HISTORY_BACKUP_FILE):
-        try:
-            with open(HISTORY_BACKUP_FILE, "r") as f:
-                data = json.load(f)
+    try:
+        with open(source, "r") as f:
+            loaded = json.load(f)
+            if isinstance(loaded, dict) and "mppt_pv_power" in loaded:
                 with data_lock:
-                    history_data.update(data)
-            log_message("BMS-Historie (inkl. heute) von SD geladen.")
-        except Exception as e:
-            log_message(f"Fehler beim Laden der BMS-Historie: {e}", "ERROR")
-
-    if os.path.exists(CONSUMPTION_BACKUP_FILE):
-        try:
-            with open(CONSUMPTION_BACKUP_FILE, "r") as f:
-                cons_data = json.load(f)
-                with data_lock:
-                    history_data["daily_cache"] = cons_data
-            log_message(f"Verbrauchshistorie ({len(cons_data)} Tage) von SD geladen.")
-        except Exception as e:
-            log_message(f"Fehler beim Laden der Verbrauchshistorie: {e}", "ERROR")
+                    history_data = loaded
+                log_message(f"History erfolgreich aus {source} geladen.")
+    except Exception as e:
+        log_message(f"History Laden Fehler: {e}", "ERROR")
 
 def save_history(backup=False):
+    """
+    Speichert atomar ins RAM. Wenn backup=True, auch permanent nach /data.
+    """
     try:
         with data_lock:
-            live_data = {k: v for k, v in history_data.items() if k != "daily_cache"}
-            cons_data = history_data.get("daily_cache", {}).copy()
-            
-            today_str = datetime.now().strftime("%d.%m.")
-            current_today_kwh = 0.0
-            
-            if "consumption" in history_data and history_data["consumption"]:
-                total_w_minutes = sum(p.get("y", 0) for p in history_data["consumption"])
-                current_today_kwh = (total_w_minutes / 60.0) / 1000.0
-            
-            cons_data[today_str] = round(current_today_kwh, 3)
+            if not any(history_data.values()): return
+            data_str = json.dumps(history_data, separators=(',', ':'), ensure_ascii=False)
 
-            try:
-                sorted_items = sorted(cons_data.items(), key=lambda x: datetime.strptime(x[0] + "2026", "%d.%m.%Y"))
-                cons_data_sorted = dict(sorted_items)
-            except Exception:
-                cons_data_sorted = cons_data
-
-            live_str = json.dumps(live_data, indent=4)
-            cons_str = json.dumps(cons_data_sorted, indent=4, sort_keys=False)
-
-        for path, content in [(HISTORY_FILE, live_str), (CONSUMPTION_FILE, cons_str)]:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path + ".tmp", "w") as f: 
-                f.write(content)
-            os.replace(path + ".tmp", path)
-
+        targets = [HISTORY_FILE]
         if backup:
-            for path, content in [(HISTORY_BACKUP_FILE, live_str), (CONSUMPTION_BACKUP_FILE, cons_str)]:
-                if path:
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    with open(path + ".tmp", "w") as f: 
-                        f.write(content)
-                    os.replace(path + ".tmp", path)
-                    
+            targets.append(HISTORY_BACKUP_FILE)
+
+        for path in targets:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(data_str)
+            os.replace(tmp, path)
+        
+        if DEBUG:
+            log_message(f"History gesichert (Permanent-Backup: {backup})")
     except Exception as e:
         log_message(f"Fehler beim Speichern: {e}", "ERROR")
 
-def get_history_window():
-    now = datetime.now()
-    start_today = now.replace(hour=HISTORY_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
-    if now < start_today:
-        start = start_today - timedelta(days=1)
-        end = start_today
-    else:
-        start = start_today
-        end = start_today + timedelta(days=1)
-    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
-
 def cleanup_old_data():
-    """Löscht veraltete Daten synchron zum eingestellten Tagesrhythmus."""
-    with data_lock:
-        now = datetime.now()
+    if datetime.now().year < 2024:
+        log_message("Systemzeit ungenau (NTP fehlt) – Cleanup übersprungen.")
+        return
 
-        cutoff_time = (time.time() - (24 * 3600)) * 1000
-        for key in ["mppt_pv_power", "mppt_pv_voltage", "consumption", "charging"]:
-            if key in history_data and isinstance(history_data[key], list):
-                history_data[key] = [p for p in history_data[key] if p.get("x", 0) > cutoff_time]
+    now = datetime.now()
+    cutoff_dt = now.replace(hour=4, minute=0, second=0, microsecond=0)
+
+    if now < cutoff_dt:
+        cutoff_dt = cutoff_dt - timedelta(days=1)
         
-        if "daily_cache" in history_data:
-
-            logischer_heute = now if now.hour >= HISTORY_WINDOW_START_HOUR else now - timedelta(days=1)
-            
-            valid_dates = []
-            for i in range(32):
-                date_str = (logischer_heute - timedelta(days=i)).strftime("%d.%m.")
-                valid_dates.append(date_str)
-            
-            original_count = len(history_data["daily_cache"])
-            history_data["daily_cache"] = {
-                date: val for date, val in history_data["daily_cache"].items() 
-                if date in valid_dates
-            }
-            
-            if original_count > len(history_data["daily_cache"]):
-                removed_count = original_count - len(history_data['daily_cache'])
-                log_message(f"Cleanup: {removed_count} Tage entfernt (Sync zu {HISTORY_WINDOW_START_HOUR}h)")
+    cutoff_ms = int(cutoff_dt.timestamp() * 1000)
+    
+    with data_lock:
+        for k in history_data:
+            history_data[k] = [p for p in history_data[k] if p.get("x", 0) > cutoff_ms]
+    
+    if DEBUG:
+        log_message(f"History-Cleanup: Daten vor {cutoff_dt.strftime('%H:%M')} gelöscht.")
 
 def get_dbus_value_immediate(service, path):
     try:
@@ -483,105 +394,84 @@ def get_dbus_value_immediate(service, path):
         return None
 
 def history_autosaver():
-    """Speichert die aktuellen Live-Daten regelmäßig permanent auf die SD-Karte."""
     while True:
-        time.sleep(HISTORY_AUTOSAVE_INTERVAL * 60)
-        save_history(backup=True)
+        time.sleep(HISTORY_AUTOSAVE_INTERVAL)
+        save_history()
 
 def collect_data():
-    log_message("History-Sammler gestartet (Zentraler Reset über HISTORY_WINDOW_START_HOUR)")
-    global cell_daily_stats
+    log_message("History-Sammler gestartet (5s Intervall mit Mittelwertbildung)")
     samples = []
     last_save_time = time.time()
 
     while True:
         try:
-            now_dt = datetime.now()
-            if now_dt.year < 2024:
+            if datetime.now().year < 2024:
                 time.sleep(30)
                 continue
 
-            if now_dt.hour == HISTORY_WINDOW_START_HOUR and now_dt.minute == 0 and now_dt.second < 10:
-                with data_lock:
-                    cons_history = list(history_data.get("consumption", []))
-                    if cons_history:
-                        total_wh = sum(p.get("y", 0) for p in cons_history) / 60.0
-                        kwh_today = round(total_wh / 1000.0, 3)
-                        
-                        yesterday_str = (now_dt - timedelta(days=1)).strftime("%d.%m.")
-                        if "daily_cache" not in history_data:
-                            history_data["daily_cache"] = {}
-                        history_data["daily_cache"][yesterday_str] = kwh_today
-                        log_message(f"Tagesverbrauch archiviert: {yesterday_str} = {kwh_today} kwh")
-
-                    cleanup_old_data()
-                    
-                    history_data["consumption"] = []
-                    history_data["charging"] = []
-                    history_data["mppt_pv_power"] = []
-                    history_data["mppt_pv_voltage"] = []
-                    log_message(f"Tages-Reset der Live-Listen durchgeführt (Stunde: {HISTORY_WINDOW_START_HOUR})")
-                
-
-                save_history(backup=True)
-                time.sleep(10)
-
-            reset_id = now_dt.strftime("%Y-%m-%d") if now_dt.hour >= HISTORY_WINDOW_START_HOUR else (now_dt - timedelta(days=1)).strftime("%Y-%m-%d")
-            
             with data_lock:
-                if cell_daily_stats.get('last_reset_day') != reset_id:
-                    cell_daily_stats['min'] = [4.5] * CELL_COUNT
-                    cell_daily_stats['max'] = [0.0] * CELL_COUNT
-                    cell_daily_stats['last_reset_day'] = reset_id
-                    log_message(f"Zell-Tagesstatistik zurückgesetzt für {reset_id}")
-
-                if time.time() - (last_update / 1000) <= 10:
-                    current_cells = bms_data.get('cells', [])
-                    for i, v in enumerate(current_cells):
-                        if i < CELL_COUNT and v > 2.0:
-                            if v < cell_daily_stats['min'][i]: cell_daily_stats['min'][i] = v
-                            if v > cell_daily_stats['max'][i]: cell_daily_stats['max'][i] = v
+                if time.time() - (last_update / 1000) > 10:
+                    time.sleep(5)
+                    continue
                     
-                    samples.append({
-                        'p_pv': bms_data.get('pv_power', 0),
-                        'v_pv': bms_data.get('pv_voltage', 0),
-                        'p_batt': bms_data.get('power', 0)
-                    })
+                v = bms_data.get('voltage', 0)
+                p_pv = bms_data.get('pv_power', 0)
+                v_pv = bms_data.get('pv_voltage', 0)
+                p_batt = bms_data.get('power', 0)
+
+            if v <= 0.1:
+                time.sleep(10)
+                continue
+
+            samples.append({
+                'p_pv': p_pv,
+                'v_pv': v_pv,
+                'p_batt': p_batt
+            })
 
             now = time.time()
             if now - last_save_time >= 60:
                 if samples:
-                    avg_pv = sum(s['p_pv'] for s in samples) / len(samples)
+                    avg_p_pv = sum(s['p_pv'] for s in samples) / len(samples)
                     avg_v_pv = sum(s['v_pv'] for s in samples) / len(samples)
-                    avg_batt = sum(s['p_batt'] for s in samples) / len(samples)
+                    avg_p_batt = sum(s['p_batt'] for s in samples) / len(samples)
+                    
                     now_ms = int(now * 1000)
                     
                     with data_lock:
-                        actual_cons = max(0, avg_pv - avg_batt) 
-                        history_data["mppt_pv_power"].append({"x": now_ms, "y": round(avg_pv)})
+                        history_data["mppt_pv_power"].append({"x": now_ms, "y": round(avg_p_pv)})
                         history_data["mppt_pv_voltage"].append({"x": now_ms, "y": round(avg_v_pv, 1)})
-                        history_data["consumption"].append({"x": now_ms, "y": round(actual_cons)})
-                        history_data["charging"].append({"x": now_ms, "y": round(max(0, avg_batt))})
+                        history_data["consumption"].append({"x": now_ms, "y": round(abs(avg_p_batt)) if avg_p_batt < 0 else 0})
+                        history_data["charging"].append({"x": now_ms, "y": round(avg_p_batt) if avg_p_batt > 0 else 0})
 
                 if USE_VICTRON_DAILY_YIELD and mppt_services:
                     vy_today = get_mppt_daily_yield(0)
                     vy_yesterday = get_mppt_daily_yield(1)
-                    if now_dt.hour < HISTORY_WINDOW_START_HOUR:
-                        vy_today = 0.0 
+                   
+                    now_hour = datetime.now().hour
+                    if (
+                        vy_today is not None
+                       and vy_yesterday is not None
+                       and now_hour < 4
+                       and abs(vy_today - vy_yesterday) < 0.001
+                    ):
+                       vy_today = 0.0
 
                     with data_lock:
-                        if vy_today is not None: bms_data['daily_pv_yield'] = round(vy_today, 3)
-                        if vy_yesterday is not None: bms_data['yield_yesterday'] = round(vy_yesterday, 3)
+                        if vy_today is not None:
+                            bms_data['daily_pv_yield'] = round(vy_today, 3)
+                        if vy_yesterday is not None:
+                            bms_data['yield_yesterday'] = round(vy_yesterday, 3)
 
                 cleanup_old_data()
-                save_history(backup=False) 
-                
                 samples = []
                 last_save_time = now
 
-            time.sleep(5)
+            time.sleep(5) 
+
         except Exception as e:
             log_message(f"collect_data Fehler: {e}", "ERROR")
+            samples = []
             time.sleep(10)
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -590,7 +480,6 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 class BMSHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        """Unterdrückt die Standard-Log-Ausgaben im Terminal für HTTP-Requests"""
         return
 
     def proxy_tasmota(self):
@@ -598,18 +487,18 @@ class BMSHandler(BaseHTTPRequestHandler):
             path_parts = self.path.split('/')
             if len(path_parts) < 3:
                 raise ValueError("Keine IP angegeben")
-            
             ip = path_parts[2].split('?')[0]
             query = self.path.split('cmd=')[1] if 'cmd=' in self.path else 'Power'
-            
             if ip not in TASMOTA_IPS:
                 raise ValueError(f"Unbekannte Tasmota-IP: {ip}")
             
             url = f"http://{ip}/cm?cmnd={query}"
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=4) as response:
-                res_data = response.read()
+            req.add_header('User-Agent', 'VenusOS-Dashboard-Proxy')
             
+            with urllib.request.urlopen(req, timeout=5) as response:
+                res_data = response.read()
+                
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
@@ -625,53 +514,13 @@ class BMSHandler(BaseHTTPRequestHandler):
                 fallback["FriendlyName1"] = "Offline"
             self.wfile.write(json.dumps(fallback).encode())
 
-    def serve_history30(self):
-        data30 = []
-        now = datetime.now()
-
-        if now.hour < HISTORY_WINDOW_START_HOUR:
-            current_logical_day = now - timedelta(days=1)
-        else:
-            current_logical_day = now
-
-        with data_lock:
-            cons_history = list(history_data.get("consumption", []))
-            total_cons_wh = sum(p.get("y", 0) for p in cons_history) / 60.0
-            live_today_kwh = round(total_cons_wh / 1000.0, 3)
-            cache = history_data.get("daily_cache", {})
-
-        for i in range(29, -1, -1):
-            target_date = current_logical_day - timedelta(days=i)
-            day_str = target_date.strftime("%d.%m.")
-            
-            yield_val = get_mppt_daily_yield(i) or 0
-            
-            if i == 0:
-                day_cons = live_today_kwh
-            else:
-                day_cons = cache.get(day_str, 0)
-
-            data30.append({
-                "day": day_str, 
-                "yield": round(yield_val, 3),
-                "consumption": round(day_cons, 3)
-            })
-        
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json; charset=utf-8')
-        self.end_headers()
-        self.wfile.write(json.dumps(data30).encode())
-
     def do_GET(self):
-        """Routing für eingehende GET-Anfragen"""
         if self.path in ('/', '/index.html'):
             self.serve_html()
         elif self.path == '/data':
             self.serve_json_data()
         elif self.path == '/history':
             self.serve_history()
-        elif self.path == '/history30':
-            self.serve_history30()
         elif self.path.startswith('/tasmota/'):
             self.proxy_tasmota()
         elif self.path.startswith('/static/'):
@@ -680,20 +529,18 @@ class BMSHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def serve_history(self):
-        """Gibt die Verlaufsdaten sicher als JSON aus"""
         self.send_response(200)
         self.send_header('Content-type', 'application/json; charset=utf-8')
         self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
         with data_lock:
-            safe_history = {k: list(v) for k, v in history_data.items()}
-            history_json = json.dumps(safe_history, separators=(',', ':'))
+            history_json = json.dumps(history_data, separators=(',', ':'))
         self.wfile.write(history_json.encode())
 
     def serve_static(self):
-        """Serviert statische Dateien wie chart.js"""
         base_dir = os.path.dirname(os.path.abspath(__file__))
         path = os.path.join(base_dir, self.path.lstrip('/'))
+        
         if not os.path.isfile(path):
             self.send_error(404)
             return
@@ -705,50 +552,47 @@ class BMSHandler(BaseHTTPRequestHandler):
             self.wfile.write(f.read())
 
     def serve_json_data(self):
-        """Bereitet aktuelle BMS-Daten für das Frontend auf"""
         with data_lock:
             d = bms_data.copy()
-            history_cons = history_data.get("consumption", [])
-            total_cons_wh = sum(p.get("y", 0) for p in history_cons) / 60.0
-            daily_consumption = round(total_cons_wh / 1000.0, 3)
 
+        soc = d.get('soc', 0)
+        voltage = d.get('voltage', 0)
+        current = d.get('current', 0)
+        power = d.get('power', 0)
         minc = d.get('min_cell', 0)
         maxc = d.get('max_cell', 0)
         delta = round(maxc - minc, 3) if minc and maxc else 0
 
+        temp = d.get('temperature')
+        if temp is not None and -20 <= temp <= 80:
+            temp = round(temp, 1)
+        else:
+            temp = None
+
         bal_active = (delta > BALANCING_START_DELTA) and (maxc >= BALANCING_START_VOLTAGE)
         bal_text = "⚡" if bal_active else "Inaktiv"
         bal_color = "#ff9500" if bal_active else "#888"
-        
-        current_batt = d.get('power', 0)
 
-        monthly_yield = 0.0
-        if mppt_services:
-            for i in range(30):
-                val = get_mppt_daily_yield(i)
-                if val: monthly_yield += val
+        cells = d.get('cells', [0.000] * 8)
 
         data = {
-            "soc": d.get('soc', 0),
-            "voltage": d.get('voltage', 0),
+            "soc": soc,
+            "voltage": voltage,
             "dbus_ok": d.get("dbus_ok", False),
-            "current": d.get('current', 0),
-            "power": d.get('power', 0),
-            "battery_power": current_batt,
+            "current": current,
+            "power": power,
+            "battery_power": power,
             "balancing": {"text": bal_text, "color": bal_color, "active": bal_active},
             "delta": delta,
             "delta_color": "#0f0" if delta < 0.020 else "#ff0" if delta < 0.050 else "#f00",
             "min_cell": minc,
             "max_cell": maxc,
-            "cells": d.get('cells', [0.000] * CELL_COUNT),
-            "cell_min_daily": cell_daily_stats['min'],
-            "cell_max_daily": cell_daily_stats['max'],
-            "temperature": d.get('temperature'),
+            "cells": cells,
+            "temperature": temp,
             "pv_voltage": round(d.get('pv_voltage', 0), 1),
             "pv_power": round(d.get('pv_power', 0)),
             "daily_pv_yield": round(d.get('daily_pv_yield', 0), 3),
-            "daily_consumption": daily_consumption,
-            "monthly_yield": round(monthly_yield, 2)
+            "yield_yesterday": round(d.get('yield_yesterday', 0), 3)
         }
 
         self.send_response(200)
@@ -758,7 +602,6 @@ class BMSHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data, separators=(',', ':')).encode())
 
     def serve_html(self):
-        """Generiert das HTML-Dashboard"""
         soc_init = get_dbus_value('/Soc', 0)
         volt_init = get_dbus_value('/Dc/0/Voltage', 0)
         start_ts = int(server_start_time.timestamp() * 1000) if server_start_time else int(time.time() * 1000)
@@ -774,12 +617,12 @@ class BMSHandler(BaseHTTPRequestHandler):
 <script src="/static/luxon.js"></script>
 <script src="/static/chartjs-adapter-luxon.js"></script>
 <style>
-    :root {{--bg:#1e1e1e; --card:#2d2d2d; --text:#aaa; --accent:#00bfff; --shadow:rgba(0,0,0,0.3); --gray:#aaa; --darkgray:#555;}}
+    :root {{--bg:#1e1e1e; --card:#2d2d2d; --text:#fff; --accent:#00bfff; --shadow:rgba(0,0,0,0.3); --gray:#aaa; --darkgray:#555;}}
     [data-theme="light"] {{--bg:#f5f5f5; --card:#fff; --text:#333; --accent:#007acc; --shadow:rgba(0,0,0,0.1); --gray:#666; --darkgray:#888;}}
     *{{margin:0;padding:0;box-sizing:border-box}}
-  
+    body{{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;padding:15px;transition:background .3s,color .3s}}
     .container{{max-width:1400px;margin:0 auto;width:100%}}
-    :fullscreen .container, :-webkit-full-screen .container {{max-width: 98vw; padding: 1px;}}
+    :fullscreen .container, :-webkit-full-screen .container {{max-width: 98vw; padding: 10px;}}
     h1{{text-align:center;color:var(--accent);font-size:2.2rem;margin-bottom:15px}}
     
     /* Toast & Alerts */
@@ -805,8 +648,8 @@ class BMSHandler(BaseHTTPRequestHandler):
     .controls-visible {{opacity: 1 !important;visibility: visible !important;}}
     .theme-toggle:hover, .temp-circle:hover {{transform: scale(1.1); background: rgba(0,191,255,0.12);}}
 
-    /* Tasmota Kreise – links gestapelt */
-    .tasmota-circle {{position: fixed; right: 15px;background: var(--card); border: none;width: 50px; height: 50px; border-radius: 50%;cursor: pointer; box-shadow: 0 4px 10px var(--shadow);display: flex; align-items: center; justify-content: center;z-index: 210; transition: all 0.22s;opacity: 0; visibility: hidden;color: var(--gray); font-size: 0.75rem; font-weight: bold;text-align: center; line-height: 1.1;}}
+    /* Tasmota Kreise – rechts gestapelt */
+    .tasmota-circle {{position: fixed; right: 15px; background: var(--card); border: none;width: 50px; height: 50px; border-radius: 50%;cursor: pointer; box-shadow: 0 4px 10px var(--shadow);display: flex; align-items: center; justify-content: center;z-index: 210; transition: all 0.22s;opacity: 0; visibility: hidden;color: var(--gray); font-size: 0.75rem; font-weight: bold;text-align: center; line-height: 1.1;}}
     .tasmota-on {{ color: #00ff00 !important; }}
     .tasmota-circle:hover {{ transform: scale(1.12); background: rgba(0,191,255,0.15); }}
 
@@ -825,15 +668,14 @@ class BMSHandler(BaseHTTPRequestHandler):
     .cell-num{{font-size:1rem;color:var(--gray);display:block;margin-bottom:8px}}
     .cell-v{{font-size:1.3rem;font-weight:bold;display:block}}
     .high-cell{{color:#f00 !important}}
-    .charts-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;margin:5px 0}}
+    .charts-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px;margin:10px 0}}
     .charts-grid .full-width{{grid-column:1/-1}}
     .chart-container{{background:var(--card);border-radius:16px;box-shadow:0 4px 15px var(--shadow)}}
     .chart-content{{padding:10px}}
-    canvas{{height:230px !important;width:100% !important}}
+    canvas{{height:280px !important;width:100% !important}}
     @media (max-width:1199px){{.charts-grid{{grid-template-columns:repeat(3,1fr)}}}}
     @media (max-width:900px){{.charts-grid{{grid-template-columns:1fr}}canvas{{height:250px !important}}}}
     .footer{{text-align:center;margin:1px 0 20px;color:var(--darkgray);font-size:.9rem}}
-    body{{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;padding:0 10px;margin:0;transition:background .3s,color .3s}}
 </style>
 </head>
 <body>
@@ -842,6 +684,7 @@ class BMSHandler(BaseHTTPRequestHandler):
     <div id="tasmota-container"></div>
     <button class="theme-toggle" id="theme-toggle" title="Theme wechseln">🌙</button>
     <h1>{DASHBOARD_NAME}</h1>
+
     <div class="status-balance" id="balancing-info"><i>⚡</i> Balancing aktiv – Zellen werden ausgeglichen <i>⚡</i></div>
     <div class="status-toast" id="status-toast"><span id="status-text"></span></div>
     <div class="high-voltage-warning" id="high-voltage-warning">⚠️ Max. Ladung erreicht! ({MAX_PACK_VOLTAGE_WARNING} V) ⚠️</div>
@@ -849,34 +692,16 @@ class BMSHandler(BaseHTTPRequestHandler):
     <div class="low-soc-warning" id="low-soc-warning">⚠️ Batterie fast leer! (≤ {LOW_SOC_WARNING}%) ⚠️</div>
 
     <div class="main-grid">
-        <div class="box"><div class="big" id="voltage">{volt_init:.2f}</div><div class="label">⚡ Batterie Spannung (Volt)</div></div>
-        <div class="box"><div class="big" id="soc">{soc_init:.0f}<span>%</span></div><div class="label">🔋 Ladezustand (SoC)</div></div>
-        <div class="box">
-            <div style="display: flex; justify-content: space-between; font-size:1.1rem; margin-top: 5px; color: #888; border-top: 1px solid #444; padding-top: 3px;">
-                <span style="color: var(--gray);">☀️ Solar:</span>
-                <span id="amp-solar">0.00 A | 0 W</span>
-            </div>
-            <div style="display: flex; justify-content: space-between; font-size:1.1rem; margin-top: 5px; color: #888; border-top: 1px solid #444; padding-top: 3px;">
-                <span style="color: var(--gray);">📥 Ladung:</span>
-                <span id="amp-battery">0.00 A | 0 W</span>
-            </div>
-            <div style="display: flex; justify-content: space-between; font-size:1.1rem; margin-top: 5px; color: #888; border-top: 1px solid #444; padding-top: 3px;">
-                <span style="color: var(--gray);">🏠 Verbrauch:</span>
-                <span id="amp-consumption">0.00 A | 0 W</span>
-            </div>
-            <div style="display: flex; justify-content: space-between; font-size:1.1rem; margin-top: 5px; color: #888; border-top: 1px solid #444; padding-top: 3px;">
-                <span style="color: var(--gray);">🔄 Lade/Entladung:</span>
-                <span id="power">0 W</span>
-            </div>
-        </div>
+        <div class="box"><div class="big" id="voltage">{volt_init:.2f}</div><div class="label">Batterie Spannung (Volt)</div></div>
+        <div class="box"><div class="big" id="soc">{soc_init:.0f}<span>%</span></div><div class="label">Ladezustand (SoC)</div></div>
+        <div class="box"><div class="big" id="current">0.00</div><div class="label">BMS Strom (A) (in/out)</div></div>
     </div>
 
     <div class="info-grid">
         <div class="info"><span class="info-label">PV (MPPT V)</span><strong id="pv_voltage">0.0 V</strong></div>
         <div class="info"><span class="info-label">PV (MPPT Watt)</span><strong id="pv_power">0 W</strong></div>
-        <!-- <div class="info"><span class="info-label">Lade/Entladung</span><strong id="power">0 W</strong></div> -->
-        <div class="info"><span class="info-label">Tagesverbrauch</span><strong id="daily_consumption">0 W</strong></div>
-        <div class="info" onclick="toggleYieldDisplay()" style="cursor:pointer"><span class="info-label" id="yield-label">Tagesertrag</span><strong id="daily_pv_yield">0 W</strong></div>
+        <div class="info"><span class="info-label">Lade/Entladung</span><strong id="power">0 W</strong></div>
+        <div class="info" onclick="toggleYieldDisplay()" style="cursor:pointer"><span class="info-label" id="yield-label">Tagesertrag</span><strong id="daily_pv_yield">0 kWh</strong></div>
         <div class="info"><span class="info-label">Balancing</span><strong id="balancing">—</strong></div>
         <div class="info"><span class="info-label">Zellen-Diff</span><strong id="delta">— V</strong></div>
     </div>
@@ -884,11 +709,8 @@ class BMSHandler(BaseHTTPRequestHandler):
     <div class="cells-grid" id="cells-grid"></div>
 
     <div class="charts-grid">
-        <div class="chart-container full-width">
+        <div class="chart-container full-width" id="mppt-container">
             <div class="chart-content"><canvas id="mpptChart"></canvas></div>
-        </div>
-        <div class="chart-container full-width">
-            <div class="chart-content"><canvas id="history30Chart"></canvas></div>
         </div>
     </div>
 
@@ -896,45 +718,13 @@ class BMSHandler(BaseHTTPRequestHandler):
 </div>
 
 <script>
-const MAX_CHART_POINTS = 2000;
-        let mpptChart = null;
-        let wakeLock = null; 
-        let lastBalancingState = false;
-        let showMonthly = false;
-        let currentYieldToday = 0;
-        let currentMonthlyYield = 0;
-        let retryDelay = 1500;
-        const MAX_RETRY_DELAY = 10000;
-
-        async function requestWakeLock() {{
-            try {{
-                if ('wakeLock' in navigator) {{
-                    wakeLock = await navigator.wakeLock.request('screen');
-                    console.log('Wake Lock aktiv');
-                }}
-            }} catch (err) {{
-                console.error(`${{err.name}}, ${{err.message}}`);
-            }}
-        }}
-
-        function releaseWakeLock() {{
-            if (wakeLock !== null) {{
-                wakeLock.release();
-                wakeLock = null;
-                console.log('Wake Lock freigegeben');
-            }}
-        }}
-
-        const fullscreenChangeHandler = async () => {{
-            if (document.fullscreenElement || document.webkitFullscreenElement) {{
-                await requestWakeLock();
-            }} else {{
-                releaseWakeLock();
-            }}
-        }};
-
-        document.addEventListener('fullscreenchange', fullscreenChangeHandler);
-        document.addEventListener('webkitfullscreenchange', fullscreenChangeHandler);
+let mpptChart = null;
+let lastBalancingState = false;
+let showYesterday = false;
+let currentYieldToday = 0;
+let currentYieldYesterday = 0;
+let retryDelay = 1500;
+const MAX_RETRY_DELAY = 10000;
 
 // === Hover Logik für Buttons ===
 let idleTimer;
@@ -962,25 +752,24 @@ window.addEventListener('touchstart', showControls);
 
 // Restliche Dashboard Logik...
 function toggleYieldDisplay() {{
-            showMonthly = !showMonthly;
-            document.getElementById('yield-label').textContent = 
-                showMonthly ? "Monatsertrag" : "Tagesertrag";
-            updateYieldDisplay();
-        }}
+    showYesterday = !showYesterday;
+    document.getElementById('yield-label').textContent = 
+        showYesterday ? "Tagesertrag (Gestern)" : "Tagesertrag";
+    updateYieldDisplay();
+}}
 
-        function updateYieldDisplay() {{
-            const isM = showMonthly;
-            const val = isM ? currentMonthlyYield : currentYieldToday;
-            const el = document.getElementById('daily_pv_yield');
-            
-            if (val >= 10)      el.textContent = val.toFixed(1) + ' kw';
-            else if (val >= 1)  el.textContent = val.toFixed(2) + ' kw';
-            else                el.textContent = Math.round(val * 1000) + ' W';
-            
-            el.style.color = val > 0 
-                ? (isM ? '#ff9500' : '#00ff00') 
-                : 'var(--gray)';
-        }}
+function updateYieldDisplay() {{
+    const val = showYesterday ? currentYieldYesterday : currentYieldToday;
+    const el = document.getElementById('daily_pv_yield');
+    
+    if (val >= 10)      el.textContent = val.toFixed(1) + ' kWh';
+    else if (val >= 1)  el.textContent = val.toFixed(2) + ' kWh';
+    else                el.textContent = Math.round(val * 1000) + ' Wh';
+    
+    el.style.color = val > 0 
+        ? (showYesterday ? '#ff9500' : '#00ff00') 
+        : 'var(--gray)';
+}}
 
 let theme = localStorage.getItem('theme') || 'dark';
 document.documentElement.setAttribute('data-theme', theme);
@@ -993,27 +782,16 @@ themeBtn.onclick = () => {{
     themeBtn.textContent = theme === 'light' ? '☀️' : '🌙';
 }}
 
-tempBtn.onclick = async () => {{
-    try {{
-        if (!document.fullscreenElement && !document.webkitFullscreenElement) {{
-            const doc = document.documentElement;
-            if (doc.requestFullscreen) await doc.requestFullscreen();
-            else if (doc.webkitRequestFullscreen) await doc.webkitRequestFullscreen();
-        }} else {{
-            if (document.exitFullscreen) await document.exitFullscreen();
-            else if (document.webkitExitFullscreen) await document.webkitExitFullscreen();
-        }}
-    }} catch (err) {{
-        console.error("Fullscreen Fehler:", err);
+tempBtn.onclick = () => {{
+    const doc = document.documentElement;
+    if (!document.fullscreenElement && !document.webkitFullscreenElement) {{
+        if (doc.requestFullscreen) doc.requestFullscreen();
+        else if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
+    }} else {{
+        if (document.exitFullscreen) document.exitFullscreen();
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
     }}
 }};
-
-// Automatisches Re-Aktivieren, wenn man zum Tab zurückkehrt (nur im Fullscreen)
-document.addEventListener('visibilitychange', async () => {{
-    if ((document.fullscreenElement || document.webkitFullscreenElement) && document.visibilityState === 'visible') {{
-        await requestWakeLock();
-    }}
-}});
 
 const startTime = {start_ts};
 function updateUptime() {{
@@ -1069,7 +847,7 @@ function initMpptChart() {{
                             let unit = context.dataset.yAxisID === 'y' ? ' V' : ' W';
                             
                             if (unit === ' W') {{
-                                if (Math.abs(val) >= 1000) return label + ': ' + (val / 1000).toFixed(2) + ' kw';
+                                if (Math.abs(val) >= 1000) return label + ': ' + (val / 1000).toFixed(2) + ' kW';
                                 return label + ': ' + Math.round(val) + ' W';
                             }}
                             return label + ': ' + val.toFixed(2) + unit;
@@ -1206,48 +984,25 @@ function updateData() {{
             }}
         }}
 
-        const bmsCurrent = data.current || 0;
-        const bmsVolt = data.voltage || 1; 
-        const pvPower = data.pv_power || 0;
-        const unitA = " A";
-        const unitW = " W";
-        const sep = " | ";
-
-        // 1. Solar
-        const solarAmp = pvPower / bmsVolt;
-        const elSolar = document.getElementById('amp-solar');
-        elSolar.textContent = solarAmp.toFixed(2) + unitA + sep + Math.round(pvPower) + unitW;
-        elSolar.style.color = solarAmp > 0.05 ? "#00ff00" : "var(--gray)";
-
-        // 2. Ladung (direkt vom BMS)
-        const elBatt = document.getElementById('amp-battery');
-        const battPower = bmsCurrent * bmsVolt;
-        if (bmsCurrent > 0.05) {{
-            elBatt.textContent = bmsCurrent.toFixed(2) + unitA + sep + Math.round(battPower) + unitW;
-            elBatt.style.color = "#00ff00";
-        }} else {{
-            elBatt.textContent = "0.00" + unitA + sep + "0" + unitW;
-            elBatt.style.color = "var(--gray)";
-        }}
-
-        // 3. Verbrauch (Berechnet aus Solar & BMS-Fluss)
-        const consumptionAmp = solarAmp - bmsCurrent;
-        const consumptionWatt = pvPower - (bmsCurrent * bmsVolt);
-        const elCons = document.getElementById('amp-consumption');
-        if (consumptionAmp > 0.05) {{
-            elCons.textContent = "-" + consumptionAmp.toFixed(2) + unitA + sep + Math.round(consumptionWatt) + unitW;
-            elCons.style.color = "#f00"; // Knallrot bei Verbrauch
-        }} else {{
-            elCons.textContent = "0.00" + unitA + sep + "0" + unitW;
-            elCons.style.color = "var(--gray)";
-        }}
-        
         const pwr = data.power || 0;
-        const pwrEl = document.getElementById('power');
-        if (pwrEl) {{
-            pwrEl.textContent = Math.abs(pwr) > 10 ? (pwr > 0 ? '+' : '') + Math.round(pwr) + ' W' : '0 W';
-            pwrEl.style.color = Math.abs(pwr) <= 10 ? 'var(--gray)' : (pwr > 0 ? '#0f0' : '#f00');
+        const cur = document.getElementById('current');
+        const absC = Math.abs(data.current || 0);
+        if (absC < 0.1) {{
+            cur.textContent = '0.00';
+            cur.style.color = 'var(--gray)';
+            cur.style.animation = 'none';
+        }} else if (data.current > 0) {{
+            cur.textContent = '+' + data.current.toFixed(2);
+            cur.style.color = '#0f0';
+            cur.style.animation = 'none';
+        }} else {{
+            cur.textContent = data.current.toFixed(2);
+            cur.style.color = '#f00';
+            cur.style.animation = 'blink 3s infinite ease-in-out';
         }}
+
+        document.getElementById('power').textContent = Math.abs(pwr) > 10 ? (pwr > 0 ? '+' : '') + Math.round(pwr) + ' W' : '0 W';
+        document.getElementById('power').style.color = Math.abs(pwr) <= 10 ? 'var(--gray)' : (pwr > 0 ? '#0f0' : '#f00');
 
         const pvP = Math.round(data.pv_power || 0);
         document.getElementById('pv_power').textContent = pvP + ' W';
@@ -1263,23 +1018,7 @@ function updateData() {{
         document.getElementById('delta').style.color = data.delta_color;
 
         currentYieldToday = data.daily_pv_yield || 0;
-        currentMonthlyYield = data.monthly_yield || 0;
-        const consVal = data.daily_consumption || 0;
-        const consEl = document.getElementById('daily_consumption');
-        const consWh = consVal * 1000; //
-
-        if (consWh < 1000) {{
-            consEl.textContent = Math.round(consWh) + ' W';
-        }} else {{
-            consEl.textContent = consVal.toFixed(2) + ' kw';
-        }}
-
-        // Farbe steuern: Grau wenn 0, sonst Rot
-        if (consVal <= 0.001) {{
-            consEl.style.color = 'var(--gray)';
-        }} else {{
-            consEl.style.color = '#f00';
-        }}
+        currentYieldYesterday = data.yield_yesterday || 0;
         updateYieldDisplay();
 
         if (data.temperature !== null && data.temperature > -40) {{
@@ -1294,10 +1033,6 @@ function updateData() {{
                         <div class="cell-num">Zelle ${{String(i+1).padStart(2,'0')}}</div>
                         <div class="cell-v" id="cell-v-${{i}}">0.000 V</div>
                         <div id="cell-warn-${{i}}"></div>
-                        <div style="display: flex; justify-content: space-between; font-size: 0.7rem; margin-top: 5px; color: #888; border-top: 1px solid #444; padding-top: 3px;">
-                            <span>Min: <span id="c-min-${{i}}">-</span></span>
-                            <span>Max: <span id="c-max-${{i}}">-</span></span>
-                        </div>
                     </div>`;
             }});
         }}
@@ -1305,12 +1040,6 @@ function updateData() {{
         data.cells.forEach((v, i) => {{
             const vCellEl = document.getElementById(`cell-v-${{i}}`);
             const warnCellEl = document.getElementById(`cell-warn-${{i}}`);
-            
-            if (data.cell_min_daily && data.cell_max_daily) {{
-                document.getElementById(`c-min-${{i}}`).textContent = data.cell_min_daily[i].toFixed(3);
-                document.getElementById(`c-max-${{i}}`).textContent = data.cell_max_daily[i].toFixed(3);
-            }}
-
             let color = (v >= 3.0 && v <= 3.65) ? '#0f0' : (v > 0.1 ? '#ff0' : '#555');
             let cls = '';
             let ico = '';
@@ -1332,22 +1061,12 @@ function updateData() {{
         const now = Date.now();
         const lastDs = mpptChart.data.datasets[0].data;
         const lastTs = lastDs.length > 0 ? lastDs[lastDs.length - 1].x : 0;
-
-        if (now - lastTs > 60000 || lastDs.length === 0) {{
-            const pwr_pv = data.pv_power || 0;
-            const pwr_batt = data.battery_power || 0;
-            const pwr_cons = Math.max(0, pwr_pv - pwr_batt); 
-
-            mpptChart.data.datasets[0].data.push({{ x: now, y: pwr_pv }});
+        if (now - lastTs > 55000 || lastDs.length === 0) {{
+            mpptChart.data.datasets[0].data.push({{ x: now, y: data.pv_power || 0 }});
             mpptChart.data.datasets[1].data.push({{ x: now, y: data.pv_voltage || 0 }});
-            mpptChart.data.datasets[2].data.push({{ x: now, y: pwr_cons }});
-            mpptChart.data.datasets[3].data.push({{ x: now, y: pwr_batt }});
-
-            // Verhindert das Explodieren der Datenmenge im Browser-RAM
-            if (mpptChart.data.datasets[0].data.length > MAX_CHART_POINTS) {{
-                mpptChart.data.datasets.forEach(ds => ds.data.shift());
-            }}
-
+            const p = data.battery_power || 0;
+            mpptChart.data.datasets[2].data.push({{ x: now, y: p < 0 ? Math.abs(p) : 0 }});
+            mpptChart.data.datasets[3].data.push({{ x: now, y: p > 0 ? p : 0 }});
             cleanupChartData();
             mpptChart.update('none');
         }}
@@ -1365,45 +1084,55 @@ const tasmotaIps = {tasmota_ips_json};
 const tasmotaContainer = document.getElementById('tasmota-container');
 
 function createTasmotaButtons() {{
-    tasmotaIps.forEach((ip, idx) => {{
-        const btn = document.createElement('button');
-        btn.className = 'tasmota-circle';
-        btn.id = `tasmota-btn-${{idx}}`;
-        btn.dataset.ip = ip;
-        btn.textContent = '...';
-        btn.title = 'Lade...';
-        btn.style.top = `${{75 + idx * 60}}px`;
+            tasmotaIps.forEach((ip, idx) => {{
+                const btn = document.createElement('button');
+                btn.className = 'tasmota-circle';
+                // JS-Template-Strings nutzen Backticks. 
+                // idx ist eine JS-Variable, daher ${{idx}}
+                btn.id = `tasmota-btn-${{idx}}`; 
+                btn.dataset.ip = ip;
+                btn.textContent = '...';
+                btn.title = 'Lade...';
+                btn.style.top = `${{75 + idx * 60}}px`;
 
-        loadTasmotaName(ip, btn);
+                tasmotaContainer.appendChild(btn);
 
-        btn.onclick = async (e) => {{
-            e.stopPropagation();
-            btn.textContent = "...";
+                setTimeout(() => {{
+                    loadTasmotaName(ip, btn);
+                    updateTasmotaStatus(idx);
+                }}, idx * 300);
+
+                btn.onclick = async (e) => {{
+                    e.stopPropagation();
+                    btn.textContent = "...";
+                    try {{
+                        await fetch(`/tasmota/${{ip}}?cmd=Power%20Toggle`);
+                        setTimeout(() => updateTasmotaStatus(idx), 800);
+                    }} catch (err) {{
+                        showToast(`Umschalten fehlgeschlagen – ${{ip}}`, 'error');
+                        setTimeout(() => updateTasmotaStatus(idx), 1500);
+                    }}
+                }};
+            }});
+        }}
+
+        async function loadTasmotaName(ip, btn, retryCount = 0) {{
             try {{
-                await fetch(`/tasmota/${{ip}}?cmd=Power%20Toggle`);
-                setTimeout(() => updateTasmotaStatus(idx), 600);
+                const r = await fetch(`/tasmota/${{ip}}?cmd=FriendlyName1`);
+                if (!r.ok) throw new Error("Offline");
+                const data = await r.json();
+                let name = data.FriendlyName1?.trim() || ip;
+                if (!name.trim() || name === "Offline") name = ip;
+                btn.title = name;
             }} catch (err) {{
-                showToast(`Umschalten fehlgeschlagen – ${{ip}}`, 'error');
-                setTimeout(() => updateTasmotaStatus(idx), 1500);
+                if (retryCount < 3) {{
+                    console.log(`Retry Name für ${{ip}} (${{retryCount + 1}}/3)`);
+                    setTimeout(() => loadTasmotaName(ip, btn, retryCount + 1), 3000);
+                }} else {{
+                    btn.title = `Offline – ${{ip}}`;
+                }}
             }}
-        }};
-
-        tasmotaContainer.appendChild(btn);
-        updateTasmotaStatus(idx);
-    }});
-}}
-
-async function loadTasmotaName(ip, btn) {{
-    try {{
-        const r = await fetch(`/tasmota/${{ip}}?cmd=FriendlyName1`);
-        const data = await r.json();
-        let name = data.FriendlyName1?.trim() || ip;
-        if (!name.trim()) name = ip;
-        btn.title = name;
-    }} catch {{
-        btn.title = `Offline – ${{ip}}`;
-    }}
-}}
+        }}
 
 async function updateTasmotaStatus(idx) {{
     const ip = tasmotaIps[idx];
@@ -1424,7 +1153,7 @@ async function updateTasmotaStatus(idx) {{
             const state = data.POWER.trim().toUpperCase();
             btn.textContent = state;
             btn.classList.toggle('tasmota-on', state === "ON");
-            console.log(`Tasmota ${{ip}} → ${{state}}`);
+            console.log(`Tasmota ${{ip}} → ${{state}}`); // für Debugging im Console
         }} else {{
             throw new Error("Keine POWER-Antwort");
         }}
@@ -1457,129 +1186,6 @@ setInterval(() => {{
     }});
 }}, 300000);
 updateData();
-let history30Chart = null;
-
-function initHistory30Chart() {{
-    const ctx = document.getElementById('history30Chart').getContext('2d');
-    history30Chart = new Chart(ctx, {{
-        type: 'bar',
-        data: {{
-            labels: [],
-            datasets: [
-                {{
-                    label: 'Ertrag',
-                    data: [],
-                    backgroundColor: 'rgba(0, 255, 68, 0.15)',
-                    borderColor: '#00ff00',
-                    borderWidth: 1,
-                    yAxisID: 'y'
-                }},
-                {{
-                    label: 'Verbrauch',
-                    data: [],
-                    backgroundColor: 'rgba(255, 68, 68, 0.15)',
-                    borderColor: '#ff4444',
-                    borderWidth: 1,
-                    yAxisID: 'y'
-                }}
-            ]
-        }},
-        options: {{
-            maintainAspectRatio: false,
-            aspectRatio: 2,
-            plugins: {{ 
-                legend: {{ display: true }},
-                tooltip: {{
-                    enabled: true,
-                    position: 'nearest',
-                    // Automatisches Ausblenden nach 10 Sek
-                    external: function(context) {{
-                        const tooltipModel = context.tooltip;
-                        if (tooltipModel.opacity !== 0) {{
-                            if (window.historyTimer) clearTimeout(window.historyTimer);
-                            window.historyTimer = setTimeout(() => {{
-                                tooltipModel.opacity = 0;
-                                // Setzt aktive Elemente zurück (wichtig für Tablets)
-                                context.chart.setActiveElements([]);
-                                context.chart.update();
-                            }}, 10000); // 10 Sekunden
-                        }}
-                    }},
-                    callbacks: {{
-                        label: function(context) {{
-                            let label = context.dataset.label || '';
-                            let val = context.parsed.y;
-                            if (val >= 1) return label + ': ' + val.toFixed(2) + ' kw';
-                            return label + ': ' + (val * 1000).toFixed(0) + ' W';
-                        }}
-                    }}
-                }}
-            }},
-            scales: {{
-                y: {{ 
-                    type: 'linear',
-                    display: true,
-                    position: 'left',
-                    beginAtZero: true,
-                    // "grace" wird oft von der Tick-Berechnung ignoriert, 
-                    // wenn Chart.js "schöne" Zahlen bevorzugt.
-                    // Wir lassen es drin, fügen aber eine Berechnung für das Ende hinzu:
-                    grace: '2%', 
-                    title: {{ display: true, text: 'Energie' }},
-                    grid: {{ color: 'rgba(255, 255, 255, 0.03)' }},
-                    ticks: {{
-                        precision: 3,
-                        autoSkip: true,
-                        maxTicksLimit: 10, // Erhöht für feinere Abstufung
-                        callback: function(value) {{
-                            if (value === 0) return '0';
-                            if (value >= 1) return value.toFixed(1) + ' kw';
-                            return (value * 1000).toFixed(0) + ' W';
-                        }}
-                    }}
-                }},
-                y1: {{ 
-                    type: 'linear',
-                    display: true,
-                    position: 'right',
-                    beginAtZero: true,
-                    // Diese Funktion koppelt die rechte Achse an die linke
-                    afterDataLimits: axis => {{
-                        axis.min = axis.chart.scales.y.min;
-                        axis.max = axis.chart.scales.y.max;
-                    }},
-                    grid: {{ drawOnChartArea: false }},
-                    title: {{ display: true, text: 'Energie' }},
-                    ticks: {{
-                        precision: 3,
-                        callback: function(value) {{
-                            if (value === 0) return '0';
-                            if (value >= 1) return value.toFixed(1) + ' kw';
-                            return (value * 1000).toFixed(0) + ' W';
-                        }}
-                    }}
-                }},
-                x: {{
-                    grid: {{ color: 'rgba(255, 255, 255, 0.00)' }}
-                }}
-            }}
-        }}
-    }});
-}}
-
-function loadHistory30() {{
-    fetch('/history30').then(r => r.json()).then(data => {{
-        history30Chart.data.labels = data.map(d => d.day);
-        history30Chart.data.datasets[0].data = data.map(d => d.yield);
-        history30Chart.data.datasets[1].data = data.map(d => d.consumption); // <--- WICHTIG
-        history30Chart.update();
-    }});
-}}
-
-// Aufrufe am Ende des Scripts innerhalb des f-Strings:
-initHistory30Chart();
-loadHistory30();
-setInterval(loadHistory30, 30000);
 </script>
 </body>
 </html>"""
@@ -1619,9 +1225,7 @@ if __name__ == '__main__':
     signal.signal(signal.SIGINT,  signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     load_history()
-    ensure_cell_stats()
     cleanup_old_data()
-    
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()
     try:
