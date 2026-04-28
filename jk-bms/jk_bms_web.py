@@ -53,7 +53,8 @@ history_data = {
     "mppt_pv_power":   [],
     "mppt_pv_voltage": [],
     "consumption":     [],
-    "charging":        []
+    "charging":        [],
+    "cell_extremes":   {}
 }
 bms_data = {}
 data_lock = threading.Lock()
@@ -68,13 +69,18 @@ def log_message(message, level="INFO"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     full = f"[{timestamp}] [{level}] {message}"
     try:
-        with open(LOG_FILE, 'a') as f:
-            f.write(full + "\n")
+        # Prüfen, ob das Verzeichnis für das Log existiert (wichtig bei /var/volatile/tmp/)
+        log_dir = os.path.dirname(LOG_FILE)
+        if os.path.exists(log_dir):
+            with open(LOG_FILE, 'a') as f:
+                f.write(full + "\n")
+        
+        # Konsolen-Ausgabe bei Fehlern oder Debug-Modus
         if DEBUG or level in ["ERROR", "WARNING"]:
             print(full)
-    except:
-        pass
-
+    except Exception as e:
+        # Falls die SD-Karte klemmt oder Read-Only ist, Fehlermeldung nur drucken
+        print(f"CRITICAL: Log-Schreibfehler ({e}) - Nachricht: {message}")
 def get_running_pids():
     pids = []
     try:
@@ -333,10 +339,14 @@ def load_history():
     try:
         with open(source, "r") as f:
             loaded = json.load(f)
-            if isinstance(loaded, dict) and "mppt_pv_power" in loaded:
+            if isinstance(loaded, dict):
                 with data_lock:
-                    history_data = loaded
-                log_message(f"History erfolgreich aus {source} geladen.")
+                    if "history" in loaded:
+                        history_data = loaded["history"]
+                        bms_data['daily_consumption_wh'] = loaded.get("daily_consumption_wh", 0)
+                    else:
+                        history_data = loaded
+                log_message(f"History & Zähler erfolgreich aus {source} geladen.")
     except Exception as e:
         log_message(f"History Laden Fehler: {e}", "ERROR")
 
@@ -346,8 +356,13 @@ def save_history(backup=False):
     """
     try:
         with data_lock:
-            if not any(history_data.values()): return
-            data_str = json.dumps(history_data, separators=(',', ':'), ensure_ascii=False)
+            to_save = {
+                "history": history_data,
+                "daily_consumption_wh": bms_data.get('daily_consumption_wh', 0)
+            }
+            if not any(history_data.values()) and to_save["daily_consumption_wh"] == 0: 
+                return
+            data_str = json.dumps(to_save, separators=(',', ':'), ensure_ascii=False)
 
         targets = [HISTORY_FILE]
         if backup:
@@ -361,7 +376,7 @@ def save_history(backup=False):
             os.replace(tmp, path)
         
         if DEBUG:
-            log_message(f"History gesichert (Permanent-Backup: {backup})")
+            log_message(f"History & Zähler gesichert (Permanent-Backup: {backup})")
     except Exception as e:
         log_message(f"Fehler beim Speichern: {e}", "ERROR")
 
@@ -379,11 +394,17 @@ def cleanup_old_data():
     cutoff_ms = int(cutoff_dt.timestamp() * 1000)
     
     with data_lock:
+        # Den berechneten Verbrauch nullen, wenn wir genau am Cutoff-Zeitpunkt sind
+        if now.hour == 4 and now.minute == 0:
+            bms_data['daily_consumption_wh'] = 0
+            
         for k in history_data:
-            history_data[k] = [p for p in history_data[k] if p.get("x", 0) > cutoff_ms]
+            # Nur Listen mit Zeitstempel-Daten bereinigen (Chart-Daten)
+            if isinstance(history_data[k], list):
+                history_data[k] = [p for p in history_data[k] if isinstance(p, dict) and p.get("x", 0) > cutoff_ms]
     
     if DEBUG:
-        log_message(f"History-Cleanup: Daten vor {cutoff_dt.strftime('%H:%M')} gelöscht.")
+        log_message(f"Cleanup durchgeführt. Daten vor {cutoff_dt.strftime('%H:%M')} entfernt.")
 
 def get_dbus_value_immediate(service, path):
     try:
@@ -396,7 +417,7 @@ def get_dbus_value_immediate(service, path):
 def history_autosaver():
     while True:
         time.sleep(HISTORY_AUTOSAVE_INTERVAL)
-        save_history()
+        save_history(backup=True)
 
 def collect_data():
     log_message("History-Sammler gestartet (5s Intervall mit Mittelwertbildung)")
@@ -418,10 +439,26 @@ def collect_data():
                 p_pv = bms_data.get('pv_power', 0)
                 v_pv = bms_data.get('pv_voltage', 0)
                 p_batt = bms_data.get('power', 0)
+                current_cells = bms_data.get('cells', [])
 
             if v <= 0.1:
                 time.sleep(10)
                 continue
+
+            # Zell-Min/Max aktualisieren
+            with data_lock:
+                if "cell_extremes" not in history_data:
+                    history_data["cell_extremes"] = {}
+                
+                for i, val in enumerate(current_cells):
+                    idx_str = str(i)
+                    if idx_str not in history_data["cell_extremes"]:
+                        history_data["cell_extremes"][idx_str] = {"min": val, "max": val}
+                    else:
+                        if val < history_data["cell_extremes"][idx_str]["min"] and val > 0.1:
+                            history_data["cell_extremes"][idx_str]["min"] = val
+                        if val > history_data["cell_extremes"][idx_str]["max"]:
+                            history_data["cell_extremes"][idx_str]["max"] = val
 
             samples.append({
                 'p_pv': p_pv,
@@ -437,31 +474,57 @@ def collect_data():
                     avg_p_batt = sum(s['p_batt'] for s in samples) / len(samples)
                     
                     now_ms = int(now * 1000)
+                    current_consumption_w = avg_p_pv - avg_p_batt
+                    if current_consumption_w < 0: current_consumption_w = 0
                     
                     with data_lock:
+                        # Begrenzung auf ca. 1440 Einträge (24h bei 1 Min Intervall)
+                        MAX_ENTRIES = 1500 
+                        
                         history_data["mppt_pv_power"].append({"x": now_ms, "y": round(avg_p_pv)})
                         history_data["mppt_pv_voltage"].append({"x": now_ms, "y": round(avg_v_pv, 1)})
                         history_data["consumption"].append({"x": now_ms, "y": round(abs(avg_p_batt)) if avg_p_batt < 0 else 0})
                         history_data["charging"].append({"x": now_ms, "y": round(avg_p_batt) if avg_p_batt > 0 else 0})
+                        
+                        # Listen kürzen, wenn sie zu lang werden
+                        for key in ["mppt_pv_power", "mppt_pv_voltage", "consumption", "charging"]:
+                            if len(history_data[key]) > MAX_ENTRIES:
+                                history_data[key] = history_data[key][-MAX_ENTRIES:]
+                        
+                        daily_cons = bms_data.get('daily_consumption_wh', 0)
+                        bms_data['daily_consumption_wh'] = daily_cons + (current_consumption_w / 60)
 
                 if USE_VICTRON_DAILY_YIELD and mppt_services:
                     vy_today = get_mppt_daily_yield(0)
-                    vy_yesterday = get_mppt_daily_yield(1)
-                   
-                    now_hour = datetime.now().hour
-                    if (
-                        vy_today is not None
-                       and vy_yesterday is not None
-                       and now_hour < 4
-                       and abs(vy_today - vy_yesterday) < 0.001
-                    ):
-                       vy_today = 0.0
+                    now_dt = datetime.now()
+                    
+                    # RADIKAL-RESET um 4:00 Uhr (Arbeitsspeicher leeren & Dateien löschen)
+                    if now_dt.hour == 4 and now_dt.minute == 0:
+                        with data_lock:
+                            # 1. Verbrauchszähler im RAM auf Null
+                            bms_data['daily_consumption_wh'] = 0
+                            
+                            # 2. Alle Verlaufsdaten (Charts) im RAM leeren
+                            for key in history_data:
+                                if isinstance(history_data[key], list):
+                                    history_data[key] = []
+                                elif isinstance(history_data[key], dict):
+                                    history_data[key] = {}
+                            
+                            # 3. Die Speicher-Dateien löschen
+                            for path in [HISTORY_FILE, HISTORY_BACKUP_FILE]:
+                                if os.path.exists(path):
+                                    try:
+                                        os.remove(path)
+                                        log_message(f"Reset: Datei {path} wurde gelöscht.")
+                                    except Exception as e:
+                                        log_message(f"Fehler beim Löschen: {e}", "ERROR")
+                            
+                            log_message("Täglicher System-Reset durchgeführt. Alles auf Null.")
 
                     with data_lock:
                         if vy_today is not None:
                             bms_data['daily_pv_yield'] = round(vy_today, 3)
-                        if vy_yesterday is not None:
-                            bms_data['yield_yesterday'] = round(vy_yesterday, 3)
 
                 cleanup_old_data()
                 samples = []
@@ -554,6 +617,7 @@ class BMSHandler(BaseHTTPRequestHandler):
     def serve_json_data(self):
         with data_lock:
             d = bms_data.copy()
+            extremes = history_data.get("cell_extremes", {})
 
         soc = d.get('soc', 0)
         voltage = d.get('voltage', 0)
@@ -570,9 +634,6 @@ class BMSHandler(BaseHTTPRequestHandler):
             temp = None
 
         bal_active = (delta > BALANCING_START_DELTA) and (maxc >= BALANCING_START_VOLTAGE)
-        bal_text = "⚡" if bal_active else "Inaktiv"
-        bal_color = "#ff9500" if bal_active else "#888"
-
         cells = d.get('cells', [0.000] * 8)
 
         data = {
@@ -582,17 +643,19 @@ class BMSHandler(BaseHTTPRequestHandler):
             "current": current,
             "power": power,
             "battery_power": power,
-            "balancing": {"text": bal_text, "color": bal_color, "active": bal_active},
+            "balancing": {"text": "⚡" if bal_active else "Inaktiv", "active": bal_active, "color": "#ff9500" if bal_active else "#888"},
             "delta": delta,
             "delta_color": "#0f0" if delta < 0.020 else "#ff0" if delta < 0.050 else "#f00",
             "min_cell": minc,
             "max_cell": maxc,
             "cells": cells,
+            "cell_extremes": extremes, # Neu hinzugefügt
             "temperature": temp,
             "pv_voltage": round(d.get('pv_voltage', 0), 1),
             "pv_power": round(d.get('pv_power', 0)),
             "daily_pv_yield": round(d.get('daily_pv_yield', 0), 3),
-            "yield_yesterday": round(d.get('yield_yesterday', 0), 3)
+            "yield_yesterday": round(d.get('yield_yesterday', 0), 3),
+            "daily_consumption": round(d.get('daily_consumption_wh', 0) / 1000, 3)
         }
 
         self.send_response(200)
@@ -617,7 +680,7 @@ class BMSHandler(BaseHTTPRequestHandler):
 <script src="/static/luxon.js"></script>
 <script src="/static/chartjs-adapter-luxon.js"></script>
 <style>
-    :root {{--bg:#1e1e1e; --card:#2d2d2d; --text:#fff; --accent:#00bfff; --shadow:rgba(0,0,0,0.3); --gray:#aaa; --darkgray:#555;}}
+    :root {{--bg:#1e1e1e; --card:#2d2d2d; --text:#aaa; --accent:#00bfff; --shadow:rgba(0,0,0,0.3); --gray:#aaa; --darkgray:#555;}}
     [data-theme="light"] {{--bg:#f5f5f5; --card:#fff; --text:#333; --accent:#007acc; --shadow:rgba(0,0,0,0.1); --gray:#666; --darkgray:#888;}}
     *{{margin:0;padding:0;box-sizing:border-box}}
     body{{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;padding:15px;transition:background .3s,color .3s}}
@@ -652,6 +715,16 @@ class BMSHandler(BaseHTTPRequestHandler):
     .tasmota-circle {{position: fixed; right: 15px; background: var(--card); border: none;width: 50px; height: 50px; border-radius: 50%;cursor: pointer; box-shadow: 0 4px 10px var(--shadow);display: flex; align-items: center; justify-content: center;z-index: 210; transition: all 0.22s;opacity: 0; visibility: hidden;color: var(--gray); font-size: 0.75rem; font-weight: bold;text-align: center; line-height: 1.1;}}
     .tasmota-on {{ color: #00ff00 !important; }}
     .tasmota-circle:hover {{ transform: scale(1.12); background: rgba(0,191,255,0.15); }}
+
+.cell-extremes {{
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.75rem;
+        color: #888888;
+        margin-top: 8px;
+        border-top: 1px solid rgba(255,255,255,0.05);
+        padding-top: 4px;
+    }}
 
     /* Layout-Grid */
     .main-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px;margin:10px 0}}
@@ -692,16 +765,20 @@ class BMSHandler(BaseHTTPRequestHandler):
     <div class="low-soc-warning" id="low-soc-warning">⚠️ Batterie fast leer! (≤ {LOW_SOC_WARNING}%) ⚠️</div>
 
     <div class="main-grid">
-        <div class="box"><div class="big" id="voltage">{volt_init:.2f}</div><div class="label">Batterie Spannung (Volt)</div></div>
-        <div class="box"><div class="big" id="soc">{soc_init:.0f}<span>%</span></div><div class="label">Ladezustand (SoC)</div></div>
-        <div class="box"><div class="big" id="current">0.00</div><div class="label">BMS Strom (A) (in/out)</div></div>
+        <div class="box"><div class="big" id="voltage">{volt_init:.2f}</div><div class="label">⚡ Batterie Spannung (Volt)</div></div>
+        <div class="box"><div class="big" id="soc">{soc_init:.0f}<span>%</span></div><div class="label">🔋 Ladezustand (SoC)</div></div>
+        <div class="box">
+            <div style="display: flex; justify-content: space-between; font-size:1.1rem; margin-top: 5px; color: #888; padding-top: 3px;"><span style="color: var(--gray);">☀️ Solar:</span><span id="amp-solar">0.00 A | 0 W</span></div>
+            <div style="display: flex; justify-content: space-between; font-size:1.1rem; margin-top: 5px; color: #888; border-top: 1px solid #444; padding-top: 3px;"><span style="color: var(--gray);">📥 Ladung:</span><span id="amp-battery">0.00 A | 0 W</span></div>
+            <div style="display: flex; justify-content: space-between; font-size:1.1rem; margin-top: 5px; color: #888; border-top: 1px solid #444; padding-top: 3px;"><span style="color: var(--gray);">🏠 Verbrauch:</span><span id="amp-consumption">0.00 A | 0 W</span></div>
+        </div>
     </div>
 
     <div class="info-grid">
         <div class="info"><span class="info-label">PV (MPPT V)</span><strong id="pv_voltage">0.0 V</strong></div>
         <div class="info"><span class="info-label">PV (MPPT Watt)</span><strong id="pv_power">0 W</strong></div>
-        <div class="info"><span class="info-label">Lade/Entladung</span><strong id="power">0 W</strong></div>
         <div class="info" onclick="toggleYieldDisplay()" style="cursor:pointer"><span class="info-label" id="yield-label">Tagesertrag</span><strong id="daily_pv_yield">0 kWh</strong></div>
+        <div class="info"><span class="info-label">Tagesverbrauch</span><strong id="daily_consumption">0 Wh</strong></div>
         <div class="info"><span class="info-label">Balancing</span><strong id="balancing">—</strong></div>
         <div class="info"><span class="info-label">Zellen-Diff</span><strong id="delta">— V</strong></div>
     </div>
@@ -909,175 +986,193 @@ loadHistory();
 setInterval(loadHistory, 30000);
 
 function updateData() {{
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-    fetch('/data', {{ signal: controller.signal }})
-    .then(r => {{
-        clearTimeout(timeoutId);
-        if (!r.ok) throw new Error();
-        return r.json();
-    }})
-    .then(data => {{
-        retryDelay = 1500;
-        const toast = document.getElementById('status-toast');
-        const txt   = document.getElementById('status-text');
-        const bal   = document.getElementById('balancing-info');
-        const hv_warn = document.getElementById('high-voltage-warning');
-        const lv_warn = document.getElementById('low-voltage-warning');
-        const ls_warn = document.getElementById('low-soc-warning');
+            fetch('/data', {{ signal: controller.signal }})
+            .then(r => {{
+                clearTimeout(timeoutId);
+                if (!r.ok) throw new Error();
+                return r.json();
+            }})
+            .then(data => {{
+                retryDelay = 1500;
+                const toast = document.getElementById('status-toast');
+                const txt   = document.getElementById('status-text');
+                const bal   = document.getElementById('balancing-info');
+                const hv_warn = document.getElementById('high-voltage-warning');
+                const lv_warn = document.getElementById('low-voltage-warning');
+                const ls_warn = document.getElementById('low-soc-warning');
 
-        const conn = data.voltage > 0.1 && data.soc > 0 && data.power !== undefined;
-        const bAct = data.balancing?.active || false;
+                const conn = data.voltage > 0.1 && data.soc > 0 && data.power !== undefined;
+                const bAct = data.balancing?.active || false;
 
-        if (!conn) {{
-            txt.textContent = 'Keine gültigen BMS-Daten ⚠️';
-            toast.className = 'status-toast show warning';
-            hv_warn.style.display = 'none';
-            lv_warn.style.display = 'none';
-            ls_warn.style.display = 'none';
-            setTimeout(updateData, 2000);
-            return; 
-        }} else {{
-            toast.className = 'status-toast';
-        }}
+                if (!conn) {{
+                    txt.textContent = 'Keine gültigen BMS-Daten ⚠️';
+                    toast.className = 'status-toast show warning';
+                    hv_warn.style.display = 'none';
+                    lv_warn.style.display = 'none';
+                    ls_warn.style.display = 'none';
+                    setTimeout(updateData, 2000);
+                    return; 
+                }} else {{
+                    toast.className = 'status-toast';
+                }}
 
-        if (bAct && !lastBalancingState) {{
-            bal.style.display = 'block';
-            bal.style.opacity = '1';
-            setTimeout(() => {{
-                bal.style.opacity = '0';
-                setTimeout(() => {{ bal.style.display = 'none' }}, 600);
-            }}, 3000);
-        }}
-        lastBalancingState = bAct;
+                if (bAct && !lastBalancingState) {{
+                    bal.style.display = 'block';
+                    bal.style.opacity = '1';
+                    setTimeout(() => {{
+                        bal.style.opacity = '0';
+                        setTimeout(() => {{ bal.style.display = 'none' }}, 600);
+                    }}, 3000);
+                }}
+                lastBalancingState = bAct;
 
-        const v = data.voltage || 0;
-        const vEl = document.getElementById('voltage');
-        vEl.textContent = v.toFixed(2);
+                const v = data.voltage || 1;
+                const s = data.soc || 0;
+                const pwr = data.power || 0;
+                const pvP = Math.round(data.pv_power || 0);
+                const pvV = data.pv_voltage || 0;
+                const pvA = pvP / v;
 
-        let col = '#f00';
-        if (v >= {MAX_PACK_VOLTAGE_WARNING}) col = '#f00';
-        else if (v >= 28.0) col = '#ff9500';
-        else if (v >= 26.0) col = '#0f0';
-        else if (v >= 24.01) col = '#ff0';
-        vEl.style.color = col;
-        vEl.style.animation = v >= {MAX_PACK_VOLTAGE_WARNING} ? 'blink 1s infinite' : 'none';
+                const vEl = document.getElementById('voltage');
+                vEl.textContent = v.toFixed(2);
+                vEl.style.color = v >= 29.40 ? '#f00' : (v >= 28.0 ? '#ff9500' : (v >= 26.0 ? '#0f0' : '#ff0'));
+                vEl.style.animation = v >= 29.40 ? 'blink 1s infinite' : 'none';
 
-        const s = data.soc || 0;
-        const socEl = document.getElementById('soc');
-        socEl.innerHTML = s.toFixed(0) + '<span>%</span>';
-        socEl.style.color = s >= 95 ? '#0f0' : s >= 70 ? '#ff0' : s >= 40 ? '#ff9500' : '#f00';
-        socEl.style.animation = s <= 25 ? 'blink 1s infinite' : (data.current >= {MIN_CHARGE_CURRENT_FOR_PULSE}) ? 'blink 3s infinite ease-in-out' : 'none';
+                const socEl = document.getElementById('soc');
+                socEl.innerHTML = s.toFixed(0) + '<span>%</span>';
+                socEl.style.color = s >= 95 ? '#0f0' : (s >= 70 ? '#ff0' : (s >= 40 ? '#ff9500' : '#f00'));
+                socEl.style.animation = s <= 25 ? 'blink 1s infinite' : (data.current >= 1.0 ? 'blink 3s infinite ease-in-out' : 'none');
 
-        if (v > 1.0) {{
-            hv_warn.style.display = v >= {MAX_PACK_VOLTAGE_WARNING} ? 'block' : 'none';
-            lv_warn.style.display = ({LOW_VOLTAGE_WARNING} > 0 && v <= {LOW_VOLTAGE_WARNING}) ? 'block' : 'none';
-        }}
+                // --- Energie-Sektion (Solar, Ladung, Verbrauch) ---
+                const solarEl = document.getElementById('amp-solar');
+                solarEl.textContent = `${{pvA.toFixed(2)}} A | ${{pvP}} W`;
+                solarEl.style.color = pvA > 0.01 ? '#00ff00' : 'var(--gray)';
 
-        if (s > 0) {{
-            if ({LOW_SOC_WARNING} > 0 && s <= {LOW_SOC_WARNING}) {{
-                ls_warn.innerHTML = `⚠️ Batterie fast leer! (${{s.toFixed(0)}}% ≤ {LOW_SOC_WARNING}%) ⚠️`;
-                ls_warn.style.display = 'block';
-            }} else {{
-                ls_warn.style.display = 'none';
-            }}
-        }}
+                const chargeA = pwr > 0.1 ? (pwr / v) : 0;
+                const chargeP = pwr > 0.1 ? pwr : 0;
+                const chargeEl = document.getElementById('amp-battery');
+                chargeEl.textContent = `${{chargeA.toFixed(2)}} A | ${{Math.round(chargeP)}} W`;
+                chargeEl.style.color = chargeA > 0.01 ? '#00ff00' : 'var(--gray)';
 
-        const pwr = data.power || 0;
-        const cur = document.getElementById('current');
-        const absC = Math.abs(data.current || 0);
-        if (absC < 0.1) {{
-            cur.textContent = '0.00';
-            cur.style.color = 'var(--gray)';
-            cur.style.animation = 'none';
-        }} else if (data.current > 0) {{
-            cur.textContent = '+' + data.current.toFixed(2);
-            cur.style.color = '#0f0';
-            cur.style.animation = 'none';
-        }} else {{
-            cur.textContent = data.current.toFixed(2);
-            cur.style.color = '#f00';
-            cur.style.animation = 'blink 3s infinite ease-in-out';
-        }}
+                const consP = Math.max(0, pvP - pwr); 
+                const consA = consP / v;
+                const consEl = document.getElementById('amp-consumption');
+                consEl.textContent = `${{consA.toFixed(2)}} A | ${{Math.round(consP)}} W`;
+                consEl.style.color = consA > 0.01 ? '#ff0000' : 'var(--gray)';
 
-        document.getElementById('power').textContent = Math.abs(pwr) > 10 ? (pwr > 0 ? '+' : '') + Math.round(pwr) + ' W' : '0 W';
-        document.getElementById('power').style.color = Math.abs(pwr) <= 10 ? 'var(--gray)' : (pwr > 0 ? '#0f0' : '#f00');
+                // --- PV Boxen (MPPT V und MPPT W) ---
+                const pvPowerEl = document.getElementById('pv_power');
+                pvPowerEl.textContent = pvP + ' W';
+                pvPowerEl.style.color = pvP > 0.1 ? '#00ff00' : 'var(--gray)'; 
 
-        const pvP = Math.round(data.pv_power || 0);
-        document.getElementById('pv_power').textContent = pvP + ' W';
-        document.getElementById('pv_power').style.color = pvP > 0 ? '#00ff00' : 'var(--gray)';
+                const pvVoltageEl = document.getElementById('pv_voltage');
+                pvVoltageEl.textContent = pvV.toFixed(1) + ' V';
+                pvVoltageEl.style.color = pvV > 0.01 ? '#0088ff' : 'var(--gray)';
 
-        const pvV = data.pv_voltage.toFixed(1);
-        document.getElementById('pv_voltage').textContent = pvV + ' V';
-        document.getElementById('pv_voltage').style.color = parseFloat(pvV) > 0.01 ? '#0088ff' : 'var(--gray)';
+                if (v > 1.0) {{
+                    hv_warn.style.display = v >= 29.40 ? 'block' : 'none';
+                    lv_warn.style.display = (24.0 > 0 && v <= 24.0) ? 'block' : 'none';
+                }}
+                if (s > 0) {{
+                    if (25 > 0 && s <= 25) {{
+                        ls_warn.innerHTML = `⚠️ Batterie fast leer! (${{s.toFixed(0)}}% ≤ 25%) ⚠️`;
+                        ls_warn.style.display = 'block';
+                    }} else {{
+                        ls_warn.style.display = 'none';
+                    }}
+                }}
 
-        document.getElementById('balancing').textContent = data.balancing.text;
-        document.getElementById('balancing').style.color = data.balancing.color;
-        document.getElementById('delta').textContent = data.delta.toFixed(3) + ' V';
-        document.getElementById('delta').style.color = data.delta_color;
+                document.getElementById('balancing').textContent = data.balancing.text;
+                document.getElementById('balancing').style.color = data.balancing.color;
+                document.getElementById('delta').textContent = data.delta.toFixed(3) + ' V';
+                document.getElementById('delta').style.color = data.delta_color;
 
-        currentYieldToday = data.daily_pv_yield || 0;
-        currentYieldYesterday = data.yield_yesterday || 0;
-        updateYieldDisplay();
+                currentYieldToday = data.daily_pv_yield || 0;
+                currentYieldYesterday = data.yield_yesterday || 0;
+                updateYieldDisplay();
 
-        if (data.temperature !== null && data.temperature > -40) {{
-            document.getElementById('temperature').textContent = Math.round(data.temperature) + '°';
-        }}
+                const consVal = data.daily_consumption || 0; 
+                const dailyConsEl = document.getElementById('daily_consumption');
+                if (dailyConsEl) {{
+                    dailyConsEl.textContent = consVal >= 1.0 ? consVal.toFixed(2) + ' kWh' : Math.round(consVal * 1000) + ' Wh';
+                    dailyConsEl.style.color = consVal <= 0 ? 'var(--gray)' : '#f00';
+                }}
 
-        const grid = document.getElementById('cells-grid');
-        if (grid.children.length === 0) {{
-            data.cells.forEach((_, i) => {{
-                grid.innerHTML += `
-                    <div class="cell" id="cell-container-${{i}}">
-                        <div class="cell-num">Zelle ${{String(i+1).padStart(2,'0')}}</div>
-                        <div class="cell-v" id="cell-v-${{i}}">0.000 V</div>
-                        <div id="cell-warn-${{i}}"></div>
-                    </div>`;
+                if (data.temperature !== null && data.temperature > -40) {{
+                    document.getElementById('temperature').textContent = Math.round(data.temperature) + '°';
+                }}
+
+                const grid = document.getElementById('cells-grid');
+                if (grid.children.length === 0) {{
+                    data.cells.forEach((_, i) => {{
+                        grid.innerHTML += `
+                            <div class="cell" id="cell-container-${{i}}">
+                                <div class="cell-num">Zelle ${{String(i+1).padStart(2,'0')}}</div>
+                                <div class="cell-v" id="cell-v-${{i}}">0.000 V</div>
+                                <div class="cell-extremes" style="color: #888888;">
+                                    <span>Min: <span id="cell-min-${{i}}">-</span></span>
+                                    <span>Max: <span id="cell-max-${{i}}">-</span></span>
+                                </div>
+                                <div id="cell-warn-${{i}}"></div>
+                            </div>`;
+                    }});
+                }}
+
+                data.cells.forEach((vCell, i) => {{
+                    const vCellEl = document.getElementById(`cell-v-${{i}}`);
+                    const minEl = document.getElementById(`cell-min-${{i}}`);
+                    const maxEl = document.getElementById(`cell-max-${{i}}`);
+                    const warnCellEl = document.getElementById(`cell-warn-${{i}}`);
+                    
+                    let color = (vCell >= 3.0 && vCell <= 3.65) ? '#0f0' : (vCell > 0.1 ? '#ff0' : '#555');
+                    let cls = '';
+                    let ico = '';
+
+                    if (data.balancing.active) {{
+                        if (Math.abs(vCell - data.min_cell) <= 0.0005) color = '#00bfff';
+                        if (Math.abs(vCell - data.max_cell) <= 0.0005) color = '#ff9500';
+                    }}
+                    if (vCell >= 3.65) {{
+                        color = '#ff0000';
+                        cls = 'high-cell';
+                        ico = '<div style="font-size:1.2rem;color:orange;margin-top:4px;">⚠️ Hochspannung</div>';
+                    }}
+
+                    vCellEl.textContent = vCell.toFixed(3) + ' V';
+                    vCellEl.style.color = color;
+                    
+                    const ext = data.cell_extremes[i] || null;
+                    if (ext) {{
+                        minEl.textContent = ext.min.toFixed(3);
+                        maxEl.textContent = ext.max.toFixed(3);
+                    }}
+
+                    if (warnCellEl.innerHTML !== ico) warnCellEl.innerHTML = ico;
+                }});
+
+                const now = Date.now();
+                const lastDs = mpptChart.data.datasets[0].data;
+                const lastTs = lastDs.length > 0 ? lastDs[lastDs.length - 1].x : 0;
+                if (now - lastTs > 55000 || lastDs.length === 0) {{
+                    mpptChart.data.datasets[0].data.push({{ x: now, y: data.pv_power || 0 }});
+                    mpptChart.data.datasets[1].data.push({{ x: now, y: data.pv_voltage || 0 }});
+                    const p = data.battery_power || 0;
+                    mpptChart.data.datasets[2].data.push({{ x: now, y: p < 0 ? Math.abs(p) : 0 }});
+                    mpptChart.data.datasets[3].data.push({{ x: now, y: p > 0 ? p : 0 }});
+                    cleanupChartData();
+                    mpptChart.update('none');
+                }}
+                setTimeout(updateData, 2000);
+            }})
+            .catch(() => {{
+                document.getElementById('status-text').textContent = 'Verbindung verloren ⚠️';
+                document.getElementById('status-toast').className = 'status-toast show error';
+                setTimeout(updateData, 2000);
             }});
         }}
-
-        data.cells.forEach((v, i) => {{
-            const vCellEl = document.getElementById(`cell-v-${{i}}`);
-            const warnCellEl = document.getElementById(`cell-warn-${{i}}`);
-            let color = (v >= 3.0 && v <= 3.65) ? '#0f0' : (v > 0.1 ? '#ff0' : '#555');
-            let cls = '';
-            let ico = '';
-            if (data.balancing.active) {{
-                if (Math.abs(v - data.min_cell) <= 0.0005) color = '#00bfff';
-                if (Math.abs(v - data.max_cell) <= 0.0005) color = '#ff9500';
-            }}
-            if (v >= {MAX_CELL_VOLTAGE_WARNING}) {{
-                color = '#ff0000';
-                cls = 'high-cell';
-                ico = `<div style="font-size:1.2rem;color:orange;margin-top:4px;">⚠️ Hochspannung</div>`;
-            }}
-            vCellEl.textContent = v.toFixed(3) + ' V';
-            vCellEl.style.color = color;
-            vCellEl.className = `cell-v ${{cls}}`;
-            if (warnCellEl.innerHTML !== ico) warnCellEl.innerHTML = ico;
-        }});
-
-        const now = Date.now();
-        const lastDs = mpptChart.data.datasets[0].data;
-        const lastTs = lastDs.length > 0 ? lastDs[lastDs.length - 1].x : 0;
-        if (now - lastTs > 55000 || lastDs.length === 0) {{
-            mpptChart.data.datasets[0].data.push({{ x: now, y: data.pv_power || 0 }});
-            mpptChart.data.datasets[1].data.push({{ x: now, y: data.pv_voltage || 0 }});
-            const p = data.battery_power || 0;
-            mpptChart.data.datasets[2].data.push({{ x: now, y: p < 0 ? Math.abs(p) : 0 }});
-            mpptChart.data.datasets[3].data.push({{ x: now, y: p > 0 ? p : 0 }});
-            cleanupChartData();
-            mpptChart.update('none');
-        }}
-        setTimeout(updateData, 2000);
-    }})
-    .catch(() => {{
-        document.getElementById('status-text').textContent = 'Verbindung verloren ⚠️';
-        document.getElementById('status-toast').className = 'status-toast show error';
-        setTimeout(updateData, 2000);
-    }});
-}}
 
 // ── Tasmota Steuerung ──
 const tasmotaIps = {tasmota_ips_json};
